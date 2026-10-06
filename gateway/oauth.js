@@ -24,7 +24,7 @@ export function createOAuth({ db, publicUrl, log }) {
       'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' https: http://localhost:* http://127.0.0.1:*; frame-ancestors 'none'",
       'x-frame-options': 'DENY' });
     res.end(`<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Authorize</title>
-<style>body{font:16px system-ui;max-width:30rem;margin:3rem auto;padding:0 1rem}input,button{font:inherit;padding:.5rem;margin:.25rem 0}input{width:100%;box-sizing:border-box}code{background:#eee;padding:0 .25rem}</style>${body}`);
+<style>body{font:16px system-ui;max-width:30rem;margin:3rem auto;padding:0 1rem}input,button{font:inherit;padding:.5rem;margin:.25rem 0}input{width:100%;box-sizing:border-box}code{background:#eee;padding:0 .25rem}.btn{display:block;text-align:center;padding:1rem;background:#2563eb;color:#fff;border-radius:10px;text-decoration:none;font-weight:600}</style>${body}`);
   };
   async function readBody(req) {
     let n = 0; const c = [];
@@ -84,9 +84,17 @@ export function createOAuth({ db, publicUrl, log }) {
     if (p.resource && p.resource.replace(/\/$/, '') !== resource) return bad('invalid_target', 'unknown resource');
     return { client };
   }
-  const redirectBack = (res, p, extra) => {
+  // Desktop browsers follow a 302. On phones a server redirect does NOT open the native app (universal links / App Links only
+  // fire on a user tap), so show a page with a big link instead and let the user tap back into the app.
+  const MOBILE = /iPhone|iPad|iPod|Android/i;
+  const redirectBack = (res, p, extra, req, client) => {
     const u = new URL(p.redirect_uri);
     for (const [k, v] of Object.entries({ ...extra, ...(p.state ? { state: p.state } : {}), iss: issuer })) u.searchParams.set(k, v);
+    if (req && MOBILE.test(req.headers['user-agent'] || '')) {
+      const denied = extra.error === 'access_denied';
+      return html(res, 200, `<h1>${denied ? 'Cancelled' : 'Approved'}</h1><p>${denied ? 'Tap to go back.' : 'Tap the button to finish and return to the app.'}</p>
+<p><a class=btn href="${esc(u.toString())}">Return to ${esc(client?.client_name || 'the app')}</a></p>`);
+    }
     res.writeHead(302, { location: u.toString(), 'cache-control': 'no-store' }); res.end();
   };
   const FIELDS = ['response_type', 'client_id', 'redirect_uri', 'code_challenge', 'code_challenge_method', 'state', 'scope', 'resource'];
@@ -96,10 +104,10 @@ export function createOAuth({ db, publicUrl, log }) {
     const p = isPost ? Object.fromEntries(new URLSearchParams(await readBody(req))) : Object.fromEntries(url.searchParams);
     const chk = checkAuthzParams(p);
     if (chk.fatal) return html(res, 400, `<h1>Error</h1><p>${esc(chk.fatal)}</p>`);
-    if (chk.redirectError) return redirectBack(res, p, chk.redirectError);
+    if (chk.redirectError) return redirectBack(res, p, chk.redirectError, req, chk.client);
 
     if (isPost) {
-      if (p.action === 'deny') return redirectBack(res, p, { error: 'access_denied' });
+      if (p.action === 'deny') return redirectBack(res, p, { error: 'access_denied' }, req, chk.client);
       const recent = fails.filter((t) => Date.now() - t < 60_000);
       fails.length = 0; fails.push(...recent);
       if (fails.length >= 5) return html(res, 429, '<h1>Too many attempts</h1><p>Wait a minute.</p>');
@@ -109,7 +117,7 @@ export function createOAuth({ db, publicUrl, log }) {
       const code = newSecret();
       db.prepare('INSERT INTO oauth_codes VALUES (?,?,?,?,?,0)').run(sha256(code), p.client_id, p.redirect_uri, p.code_challenge, Date.now() + CODE_TTL * 1000);
       log('INFO', `oauth: approved ${chk.client.client_name}`);
-      return redirectBack(res, p, { code });
+      return redirectBack(res, p, { code }, req, chk.client);
     }
     consentPage(res, p, chk.client);
   }

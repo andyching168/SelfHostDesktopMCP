@@ -105,3 +105,19 @@ test('OAuth token is not admin: management API refuses it', async () => {
   const r = await fetch(`${BASE}/api/devices`, { headers: { authorization: `Bearer ${tokens.access_token}` } });
   assert.equal(r.status, 403);
 });
+
+test('phones get a tap-to-return page instead of a 302 (so the native app can open); desktops still get the 302', async () => {
+  const body = new URLSearchParams({ ...Object.fromEntries(authzParams()), owner_token: adminTok, action: 'approve' });
+  for (const ua of ['Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15', 'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36']) {
+    const r = await fetch(`${BASE}/authorize`, { method: 'POST', redirect: 'manual', headers: { 'user-agent': ua }, body });
+    assert.equal(r.status, 200, ua);
+    const html = await r.text(); const href = /<a class=btn href="([^"]+)"/.exec(html)[1].replace(/&amp;/g, '&');
+    const u = new URL(href);
+    assert.equal(u.origin + u.pathname, REDIRECT); assert.equal(u.searchParams.get('state'), 'xyz'); assert.ok(u.searchParams.get('code')); assert.equal(u.searchParams.get('iss'), 'https://mcp.example.com');
+    assert.match(html, /Return to ChatGPT/);
+  }
+  const desk = await fetch(`${BASE}/authorize`, { method: 'POST', redirect: 'manual', headers: { 'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/130' }, body });
+  assert.equal(desk.status, 302);
+  const deny = await fetch(`${BASE}/authorize`, { method: 'POST', redirect: 'manual', headers: { 'user-agent': 'iPhone' }, body: new URLSearchParams({ ...Object.fromEntries(authzParams()), owner_token: adminTok, action: 'deny' }) });
+  assert.match(await deny.text(), /error=access_denied/);
+});
