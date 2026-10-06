@@ -2,14 +2,18 @@
 # Install the device agent as a launchd LaunchAgent (starts at login, restarts on crash).
 # Pair first:  node agent/agent.js pair https://mcp.example.com --device-id my-mac
 # Then:        bash deploy/install-macos.sh            (DRY_RUN=1 only writes the plist)
-# The agent is copied to ~/.local/share/remote-mcp-agent because launchd cannot read ~/Documents, ~/Desktop, ~/Downloads (TCC).
+# The agent runs from ~/.local/share/remote-mcp-agent because launchd cannot read ~/Documents, ~/Desktop, ~/Downloads (TCC).
+# Best: clone this repo there:  git clone https://github.com/<you>/SelfHostDesktopMCP ~/.local/share/remote-mcp-agent
+# Update later with: bash deploy/update.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
 NODE=${NODE:-$(command -v node)}; DST="$HOME/.local/share/remote-mcp-agent"; LABEL=com.selfhost.remote-mcp-agent
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 [ -f "$HOME/.config/remote-mcp/device.json" ] || { echo "no device config; run 'node agent/agent.js pair ...' first"; exit 1; }
 mkdir -p "$DST/agent" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
-cp agent/*.js "$DST/agent/"; cp package.json package-lock.json "$DST/"
+if [ "$(pwd -P)" != "$(cd "$DST" && pwd -P)" ]; then   # installing from a different checkout: copy; otherwise run in place
+  cp agent/*.js "$DST/agent/"; cp package.json package-lock.json "$DST/"
+fi
 (cd "$DST" && npm install --omit=dev --silent)
 cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

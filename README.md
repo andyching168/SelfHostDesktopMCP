@@ -66,11 +66,14 @@ node gateway/admin.js list
 ```
 OAuth grants live in `oauth_tokens`; revoke by setting `revoked_at` (see docs/SECURITY.md). If the owner token leaks: revoke it and create a new one.
 
+### Update
+`bash deploy/update.sh` on any deployed host: `git pull --ff-only`, `npm install`, restarts the systemd units / LaunchAgent that are installed there.
+
 ## Layout
 ```
 gateway/   server.js (HTTP/MCP/WS)  oauth.js  pairing.js  db.js  admin.js (offline CLI)
 agent/     agent.js (device side)   policy.js (guardrails)
-deploy/    install-linux.sh  install-macos.sh  *.service.in
+deploy/    install-linux.sh  install-macos.sh  update.sh  *.service.in
 test/      e2e, OAuth, pairing and policy tests (node --test)
 ```
 
