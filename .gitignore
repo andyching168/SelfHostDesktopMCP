@@ -1,0 +1,9 @@
+node_modules/
+*.db
+*.db-shm
+*.db-wal
+*.log
+secrets/
+device.json
+policy.json
+.env

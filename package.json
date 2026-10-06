@@ -1,0 +1,22 @@
+{
+  "name": "remote-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Self-hosted Remote MCP Gateway + Device Agent",
+  "engines": { "node": ">=22.13" },
+  "bin": {
+    "remote-mcp-gateway": "gateway/server.js",
+    "remote-mcp-agent": "agent/agent.js"
+  },
+  "scripts": {
+    "gateway": "node gateway/server.js",
+    "agent": "node agent/agent.js",
+    "admin": "node gateway/admin.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "ws": "^8.22.0"
+  }
+}

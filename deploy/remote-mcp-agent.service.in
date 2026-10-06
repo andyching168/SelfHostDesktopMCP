@@ -1,0 +1,10 @@
+[Unit]
+Description=Remote MCP Device Agent
+After=remote-mcp-gateway.service network-online.target
+[Service]
+WorkingDirectory=%h/remote-mcp
+ExecStart=/usr/bin/node agent/agent.js
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=default.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=Remote MCP Gateway
+After=network-online.target
+[Service]
+WorkingDirectory=%h/remote-mcp
+ExecStart=/usr/bin/node --disable-warning=ExperimentalWarning gateway/server.js --host @BIND_HOST@ --port 8765 --public-url @PUBLIC_URL@
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=default.target
