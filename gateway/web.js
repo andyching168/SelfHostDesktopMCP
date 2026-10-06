@@ -185,10 +185,19 @@ export function createWeb({ db, publicUrl, log, devices, listDevices, revokeDevi
 
     if (p === '/clients' && req.method === 'GET') {
       const last = (cid) => db.prepare('SELECT MAX(timestamp) t FROM audit_logs WHERE client_id=?').get(cid).t;
-      const statics = db.prepare('SELECT client_id,is_admin,created_at,revoked_at FROM client_tokens ORDER BY created_at').all().map((c) => ({ ...c, last_used: last(c.client_id) }));
+      const mode = (cid) => db.prepare('SELECT tool_mode FROM client_settings WHERE client_id=?').get(cid)?.tool_mode ?? 'stable';
+      const statics = db.prepare('SELECT client_id,is_admin,created_at,revoked_at FROM client_tokens ORDER BY created_at').all().map((c) => ({ ...c, principal: c.client_id, tool_mode: mode(c.client_id), last_used: last(c.client_id) }));
       const oauth = db.prepare("SELECT client_id,client_name,created_at,(SELECT COUNT(*) FROM oauth_tokens t WHERE t.client_id=c.client_id AND t.kind='refresh' AND t.revoked_at IS NULL AND t.expires_at>?) active_grants FROM oauth_clients c ORDER BY created_at").all(Date.now())
-        .map((c) => ({ ...c, last_used: last(`oauth:${c.client_name}:${c.client_id.slice(2, 8)}`) }));
+        .map((c) => { const principal = `oauth:${c.client_name}:${c.client_id.slice(2, 8)}`; return { ...c, principal, tool_mode: mode(principal), last_used: last(principal) }; });
       return sendJson(res, 200, { static: statics, oauth }), true;
+    }
+    if (p === '/clients/mode' && req.method === 'POST') { // how this client sees the tool list: 'stable' (fixed) or 'all' (live view of the selected device)
+      const cid = String(m.client_id ?? '');
+      const known = db.prepare('SELECT 1 FROM client_tokens WHERE client_id=?').get(cid)
+        || db.prepare('SELECT client_id,client_name FROM oauth_clients').all().some((c) => `oauth:${c.client_name}:${c.client_id.slice(2, 8)}` === cid);
+      if (!known || !['stable', 'all'].includes(m.mode)) return sendJson(res, 400, { error: 'unknown client or mode' }), true;
+      db.prepare('INSERT INTO client_settings VALUES (?,?) ON CONFLICT(client_id) DO UPDATE SET tool_mode=excluded.tool_mode').run(cid, m.mode);
+      return sendJson(res, 200, { ok: true }), true;
     }
     if ((mm = /^\/clients\/([^/]+)\/revoke$/.exec(p)) && req.method === 'POST') {
       const n = db.prepare('UPDATE client_tokens SET revoked_at=? WHERE client_id=? AND revoked_at IS NULL').run(now(), decodeURIComponent(mm[1])).changes;

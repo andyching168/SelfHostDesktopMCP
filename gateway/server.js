@@ -91,7 +91,34 @@ const GATEWAY_TOOLS = [
     description: 'Select the default remote device for following tool calls. Clients that do not keep a session should instead pass device_id on every call.',
     inputSchema: { type: 'object', properties: { device_id: { type: 'string' } }, required: ['device_id'] },
   },
+  {
+    name: 'tools_list',
+    description: 'Discover the tools a device offers, grouped by MCP server (built-in Desktop Commander plus any servers added in the console, e.g. chrome_*). Pass name for the full input schema of one tool. Call these with tool_call.',
+    inputSchema: { type: 'object', properties: {
+      device_id: { type: 'string', description: 'Target device (optional if one is selected).' },
+      server: { type: 'string', description: 'Only this MCP server, e.g. chrome-devtools.' },
+      name: { type: 'string', description: 'Return the full definition (with inputSchema) of this tool.' } } },
+  },
+  {
+    name: 'tool_call',
+    description: 'Call any tool of a device by name (see tools_list), including tools of servers added later. Use this for tools that are not listed natively.',
+    inputSchema: { type: 'object', properties: {
+      name: { type: 'string', description: 'Tool name as shown by tools_list, e.g. chrome_navigate_page.' },
+      arguments: { type: 'object', description: 'Arguments for that tool.' },
+      device_id: { type: 'string', description: 'Target device (optional if one is selected).' } }, required: ['name'] },
+  },
 ];
+const META = new Set(GATEWAY_TOOLS.map((t) => t.name));
+
+// ---- stable tool list ------------------------------------------------------------
+// The list a client sees must not depend on runtime state (which device is online/selected, which servers are running),
+// because some clients read tools/list once and never refresh. Built-in tools come from a stored snapshot; everything
+// else is reached through tools_list + tool_call.
+const getSetting = (k) => db.prepare('SELECT value FROM settings WHERE key=?').get(k)?.value ?? null;
+const setSetting = (k, v) => db.prepare('INSERT INTO settings VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(k, v);
+const builtinSnapshot = () => { try { return JSON.parse(getSetting('builtin_tools') ?? '[]'); } catch { return []; } };
+const clientMode = (clientId, override) => (['stable', 'all'].includes(override) ? override : db.prepare('SELECT tool_mode FROM client_settings WHERE client_id=?').get(clientId)?.tool_mode ?? 'stable');
+
 
 const toolErr = (code, message) => ({
   isError: true,
@@ -132,7 +159,8 @@ async function handleRpc(ctx, msg) {
   switch (method) {
     case 'ping': return {};
     case 'tools/list': {
-      const dev = devices.get(resolveDevice(ctx)) ?? [...devices.values()][0];
+      if (ctx.mode === 'stable') return { tools: [...GATEWAY_TOOLS, ...builtinSnapshot().map(withDeviceId)] };
+      const dev = devices.get(resolveDevice(ctx)) ?? [...devices.values()][0]; // 'all': whatever the selected device exposes right now
       return { tools: [...GATEWAY_TOOLS, ...(dev?.tools ?? []).map(withDeviceId)] };
     }
     case 'tools/call': return callTool(ctx, params, id);
@@ -146,14 +174,20 @@ const rpcError = (code, message) => Object.assign(new Error(message), { rpc: { c
 async function callTool(ctx, params, rpcId) {
   const { client, session } = ctx;
   const t0 = Date.now();
-  const tool = params.name;
+  let tool = params.name, args = params.arguments ?? {};
   let deviceId = null, status = 'success', errCode = null, request_id = null, detail = null;
   try {
+    if (tool === 'tool_call') { // unwrap: from here on this is an ordinary call of the inner tool (and is audited as such)
+      const inner = typeof args.name === 'string' ? args.name : '';
+      if (!inner || META.has(inner)) throw new RelayError('INVALID_ARGUMENT', 'tool_call needs the name of a device tool (see tools_list)');
+      const innerArgs = args.arguments && typeof args.arguments === 'object' && !Array.isArray(args.arguments) ? args.arguments : {};
+      tool = inner; args = { ...innerArgs, ...(args.device_id ? { device_id: args.device_id } : {}) };
+    }
     if (tool === 'devices_list') {
       return { content: [{ type: 'text', text: JSON.stringify(listDevices(), null, 2) }] };
     }
     if (tool === 'device_select') {
-      const id = params.arguments?.device_id;
+      const id = args.device_id;
       const row = db.prepare('SELECT device_id FROM devices WHERE device_id=? AND revoked_at IS NULL').get(id);
       if (!row) throw new RelayError('UNKNOWN_DEVICE', `Unknown device ${id}`);
       db.prepare('UPDATE sessions SET device_id=? WHERE session_id=?').run(id, session.session_id);
@@ -162,12 +196,34 @@ async function callTool(ctx, params, rpcId) {
       deviceId = id;
       return { content: [{ type: 'text', text: `Selected device ${id} (${devices.has(id) ? 'online' : 'offline'})` }] };
     }
-    const { device_id: _target, ...forwardArgs } = params.arguments ?? {}; // device_id is ours, not the backend's
-    deviceId = resolveDevice(ctx, params.arguments);
+    if (tool === 'tools_list') {
+      deviceId = resolveDevice(ctx, args);
+      if (!deviceId) throw new RelayError('NO_DEVICE_SELECTED', 'No device selected; call devices_list then device_select');
+      const dev = devices.get(deviceId);
+      if (!dev) throw new RelayError('DEVICE_OFFLINE', `Device ${deviceId} is offline`);
+      if (typeof args.name === 'string' && args.name) {
+        const t = dev.tools.find((x) => x.name === args.name);
+        if (!t) throw new RelayError('UNKNOWN_TOOL', `No tool ${args.name.slice(0, 80)} on ${deviceId}`);
+        return { content: [{ type: 'text', text: JSON.stringify(t, null, 2) }] };
+      }
+      // a tool belongs to the added server whose prefix it carries, otherwise to the built-in one
+      const extra = dev.backends.filter((b) => b.prefix && b.status === 'running');
+      const ownerOf = (t) => extra.find((b) => t.name.startsWith(b.prefix))?.name ?? 'desktop-commander';
+      const groups = new Map();
+      for (const t of dev.tools) {
+        const server = ownerOf(t); if (args.server && server !== args.server) continue;
+        if (!groups.has(server)) groups.set(server, []);
+        groups.get(server).push({ name: t.name, description: String(t.description || '').split('\n')[0].slice(0, 140) });
+      }
+      const servers = [...groups].map(([server, tools]) => ({ server, tools }));
+      return { content: [{ type: 'text', text: JSON.stringify({ device_id: deviceId, servers }, null, 2) }] };
+    }
+    const { device_id: _target, ...forwardArgs } = args; // device_id is ours, not the backend's
+    deviceId = resolveDevice(ctx, args);
     if (!deviceId) throw new RelayError('NO_DEVICE_SELECTED', 'No device selected; call devices_list then device_select');
     if (!devices.has(deviceId)) throw new RelayError('DEVICE_OFFLINE', `Device ${deviceId} is offline`);
     // long-running tools may declare their own timeout (ms); give them headroom, capped at 5 min
-    const wanted = Number(params.arguments?.timeout_ms);
+    const wanted = Number(args.timeout_ms);
     const timeout = Number.isFinite(wanted) ? Math.min(Math.max(cfg.callTimeoutMs, wanted + 5000), 300000) : cfg.callTimeoutMs;
     const promise = relay(deviceId, 'tools/call', { name: tool, arguments: forwardArgs }, timeout);
     const result = await promise;
@@ -227,7 +283,8 @@ async function handleMcp(req, res) {
 
   if (msg.id === undefined) { res.writeHead(202); return res.end(); } // notification
   try {
-    const result = await handleRpc({ client, session, headerDevice: req.headers['x-remote-device'] }, msg);
+    const mode = clientMode(client.client_id, new URL(req.url, 'http://x').searchParams.get('tools'));
+    const result = await handleRpc({ client, session, mode, headerDevice: req.headers['x-remote-device'] }, msg);
     json(res, 200, { jsonrpc: '2.0', id: msg.id, result });
   } catch (e) {
     json(res, 200, { jsonrpc: '2.0', id: msg.id, error: e.rpc ?? { code: -32603, message: 'Internal error' } });
@@ -320,6 +377,7 @@ function onDevice(ws, row) {
         .run(m.name ?? null, m.platform ?? null, m.hostname ?? null, JSON.stringify((dev.tools).map((t) => t.name)), now(), deviceId);
       ws.send(JSON.stringify({ type: 'hello_ack', session_id }));
       pushConfig(deviceId);
+      if (Array.isArray(m.builtin_tools) && m.builtin_tools.length && JSON.stringify(m.builtin_tools) !== getSetting('builtin_tools')) setSetting('builtin_tools', JSON.stringify(m.builtin_tools));
       log('INFO', `device ${deviceId} connected (${dev.tools.length} tools)`);
       return;
     }

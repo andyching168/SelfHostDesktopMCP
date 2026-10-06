@@ -11,7 +11,7 @@ const FIXTURE = path.resolve('test/fixtures/mock-mcp.js');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'rmcp-be-'));
 const dbPath = path.join(tmp, 'g.db'); const env = { ...process.env, RMCP_DB: dbPath };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const procs = []; let owner, clientTok, cookie, csrf, secret;
+const procs = []; let owner, clientTok, cookie, csrf, secret, bxSecret;
 
 const admin = (...a) => execFileSync('node', ['gateway/admin.js', ...a], { env, encoding: 'utf8' });
 const grab = (o, k) => new RegExp(`${k}:\\s+(\\S+)`).exec(o)[1];
@@ -20,8 +20,8 @@ async function api(p, body) {
   return { status: r.status, body: await r.json() };
 }
 let sid, n = 0;
-async function mcp(method, params) {
-  const r = await fetch(`${BASE}/mcp`, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json', authorization: `Bearer ${clientTok}`, ...(sid ? { 'mcp-session-id': sid } : {}) }, body: JSON.stringify({ jsonrpc: '2.0', id: ++n, method, params }) });
+async function mcp(method, params, mode = 'all') { // 'all' = live list (the old behaviour); null = server default (stable)
+  const r = await fetch(`${BASE}/mcp${mode ? `?tools=${mode}` : ''}`, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json', authorization: `Bearer ${clientTok}`, ...(sid ? { 'mcp-session-id': sid } : {}) }, body: JSON.stringify({ jsonrpc: '2.0', id: ++n, method, params }) });
   sid ??= r.headers.get('mcp-session-id'); return (await r.json()).result;
 }
 const toolNames = async () => (await mcp('tools/list')).tools.map((t) => t.name);
@@ -62,7 +62,7 @@ before(async () => {
   const lr = await fetch(`${BASE}/admin/api/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code: totp(secret, Date.now() + 30000) }) });
   cookie = lr.headers.get('set-cookie').split(';')[0]; csrf = (await lr.json()).csrf;
   // two devices: one with the local custom-server opt-in, one without
-  const s1 = grab(admin('device-create', 'bx'), 'device_secret'), s2 = grab(admin('device-create', 'by'), 'device_secret');
+  const s1 = bxSecret = grab(admin('device-create', 'bx'), 'device_secret'), s2 = grab(admin('device-create', 'by'), 'device_secret');
   startAgent('bx', s1, { allow_custom_backends: true }); startAgent('by', s2, null);
   await until(async () => (await api('/devices')).body.filter((d) => d.status === 'online').length === 2);
 });
@@ -122,13 +122,14 @@ test('per-tool allowlist, disable/enable, remove', async () => {
   assert.equal((await api('/devices/bx/backends')).body.servers.length, 1);
 });
 
-test('configuration survives an agent reconnect (gateway re-pushes it)', async () => {
+test('configuration survives an agent restart (gateway re-pushes it)', async () => {
   await api('/devices/bx/backends', { template: 'custom', name: 'mock-srv', params: { command: 'node', args: [FIXTURE] } });
   await until(async () => (await toolNames()).includes('mock_srv_ping2'));
-  procs[procs.length - 2].kill(); // bx agent
+  procs[procs.findIndex((p) => p.spawnargs.some((a) => a.endsWith('bx.json')))].kill();
   await until(async () => (await api('/devices')).body.find((d) => d.device_id === 'bx').status === 'offline');
-  const s = grab(admin('device-create', 'bx2'), 'device_secret'); void s; // (ids are unique; re-start bx with a fresh session below)
-  const db = new DatabaseSync(dbPath); const row = db.prepare("SELECT 1 FROM device_backends WHERE device_id='bx' AND name='mock-srv'").get(); assert.ok(row, 'desired state is stored on the gateway, not the agent');
+  startAgent('bx', bxSecret, { allow_custom_backends: true }); // a brand-new agent process knows nothing
+  await until(async () => (await toolNames()).includes('mock_srv_ping2'));
+  assert.equal((await mcp('tools/call', { name: 'mock_srv_ping2', arguments: { text: 'again' } })).content[0].text, 'pong2:again');
 });
 
 test('a server that fails to start reports an error instead of hanging', async () => {
@@ -137,4 +138,55 @@ test('a server that fails to start reports an error instead of hanging', async (
   await api('/devices/bz/backends', { template: 'custom', name: 'broken', params: { command: 'definitely-not-a-real-binary-xyz', args: [] } });
   const sv = await until(async () => { const x = (await api('/devices/bz/backends')).body.servers.find((q) => q.name === 'broken'); return x?.status === 'error' && x; });
   assert.ok(sv.error);
+});
+
+test('stable mode: tools/list never changes, add-on servers are reached with tools_list + tool_call', async () => {
+  const listStable = async () => (await mcp('tools/list', {}, null)).tools.map((t) => t.name).sort();
+  const before = await listStable();
+  assert.deepEqual(before, ['device_select', 'devices_list', 'echo', 'tool_call', 'tools_list'], 'default mode is stable: meta tools + built-in snapshot');
+
+  await api('/devices/bx/backends', { template: 'custom', name: 'mock-srv', params: { command: 'node', args: [FIXTURE] } }).catch(() => {});
+  await until(async () => (await toolNames()).includes('mock_srv_ping2')); // live view has it …
+  assert.deepEqual(await listStable(), before, '… the stable list did not move');
+
+  // discover
+  await mcp('tools/call', { name: 'device_select', arguments: { device_id: 'bx' } }, null);
+  const found = JSON.parse((await mcp('tools/call', { name: 'tools_list', arguments: {} }, null)).content[0].text);
+  const srv = found.servers.find((x) => x.server === 'mock-srv');
+  assert.deepEqual(srv.tools.map((t) => t.name).sort(), ['mock_srv_dangerous', 'mock_srv_ping2', 'mock_srv_read_path']);
+  assert.ok(found.servers.find((x) => x.server === 'desktop-commander').tools.some((t) => t.name === 'echo'));
+  const only = JSON.parse((await mcp('tools/call', { name: 'tools_list', arguments: { server: 'mock-srv' } }, null)).content[0].text);
+  assert.deepEqual(only.servers.map((x) => x.server), ['mock-srv']);
+  const one = JSON.parse((await mcp('tools/call', { name: 'tools_list', arguments: { name: 'mock_srv_ping2' } }, null)).content[0].text);
+  assert.equal(one.inputSchema.properties.text.type, 'string');
+
+  // call without it ever being in tools/list
+  const r = await mcp('tools/call', { name: 'tool_call', arguments: { name: 'mock_srv_ping2', arguments: { text: 'via-meta' } } }, null);
+  assert.equal(r.content[0].text, 'pong2:via-meta');
+  // device_id can ride on the outer call
+  assert.equal((await mcp('tools/call', { name: 'tool_call', arguments: { name: 'echo', arguments: { text: 'e' }, device_id: 'bx' } }, null)).content[0].text, 'echo: e');
+});
+
+test('tool_call: policy and routing still apply, errors are explicit, audit names the real tool', async () => {
+  const denied = await mcp('tools/call', { name: 'tool_call', arguments: { name: 'mock_srv_read_path', arguments: { path: '~/.ssh/id_rsa' } } }, null);
+  assert.equal(denied.structuredContent.error.code, 'POLICY_DENIED');
+  assert.equal((await mcp('tools/call', { name: 'tool_call', arguments: { name: 'devices_list' } }, null)).structuredContent.error.code, 'INVALID_ARGUMENT', 'no recursion into meta tools');
+  assert.equal((await mcp('tools/call', { name: 'tool_call', arguments: {} }, null)).structuredContent.error.code, 'INVALID_ARGUMENT');
+  assert.equal((await mcp('tools/call', { name: 'tool_call', arguments: { name: 'nope_tool' } }, null)).structuredContent.error.code, 'UNKNOWN_TOOL');
+  const db = new DatabaseSync(dbPath);
+  assert.ok(db.prepare("SELECT 1 FROM audit_logs WHERE tool='mock_srv_ping2' AND status='success'").get(), 'wrapped call is audited as the inner tool');
+  assert.equal(db.prepare("SELECT COUNT(*) n FROM audit_logs WHERE tool='tool_call' AND status='success'").get().n, 0, 'a successful wrapper call never appears as tool_call');
+  const d = db.prepare("SELECT error_detail FROM audit_logs WHERE tool='mock_srv_read_path' AND error_code='POLICY_DENIED' ORDER BY id DESC LIMIT 1").get();
+  assert.match(d.error_detail, /\.ssh/);
+});
+
+test('per-client mode: console can switch a client to the live list; ?tools= overrides', async () => {
+  const cl = (await api('/clients')).body.static.find((c) => c.client_id === 'cli');
+  assert.equal(cl.tool_mode, 'stable');
+  assert.equal((await api('/clients/mode', { client_id: 'cli', mode: 'bogus' })).status, 400);
+  assert.equal((await api('/clients/mode', { client_id: 'no-such', mode: 'all' })).status, 400);
+  assert.equal((await api('/clients/mode', { client_id: 'cli', mode: 'all' })).status, 200);
+  assert.ok((await mcp('tools/list', {}, null)).tools.some((t) => t.name === 'mock_srv_ping2'), 'live list now');
+  assert.ok(!(await mcp('tools/list', {}, 'stable')).tools.some((t) => t.name === 'mock_srv_ping2'), '?tools=stable wins');
+  await api('/clients/mode', { client_id: 'cli', mode: 'stable' });
 });

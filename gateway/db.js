@@ -65,6 +65,10 @@ export function openDb(path) {
       created_at    TEXT NOT NULL,
       PRIMARY KEY (device_id, name)
     );
+    CREATE TABLE IF NOT EXISTS client_settings (
+      client_id TEXT PRIMARY KEY,
+      tool_mode TEXT NOT NULL            -- 'stable' | 'all'
+    );
     CREATE TABLE IF NOT EXISTS client_defaults (
       client_id  TEXT PRIMARY KEY,
       device_id  TEXT NOT NULL,

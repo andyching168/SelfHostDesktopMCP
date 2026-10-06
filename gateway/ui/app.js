@@ -111,15 +111,17 @@ async function renderDeviceDetail() {
 }
 
 // ---- clients ----
+const modeSelect = (c) => h('label', { class: 'sub' }, 'Tool list: ', h('select', { class: 'inline', onchange: async (e) => { try { await api('/clients/mode', { body: { client_id: c.principal, mode: e.target.value } }); toast('Saved. Reconnect the client to refresh its tool list.'); } catch (err) { toast(err.message, true); } } },
+  h('option', { value: 'stable', selected: c.tool_mode === 'stable' }, 'fixed (recommended)'), h('option', { value: 'all', selected: c.tool_mode === 'all' }, 'live (changes with device)')));
 async function renderClients() {
   const { static: st, oauth } = await api('/clients'), root = $('#tab-clients');
   const stat = st.map((c) => h('div', { class: 'item' },
     h('div', { class: 'main' }, h('div', { class: 'name' }, c.client_id, ' ', c.is_admin ? h('span', { class: 'pill' }, 'owner') : null, ' ', c.revoked_at ? h('span', { class: 'pill err' }, 'revoked') : null),
-      h('div', { class: 'sub' }, `static token · created ${ago(c.created_at)} · last used ${ago(c.last_used)}`)),
+      h('div', { class: 'sub' }, `static token · created ${ago(c.created_at)} · last used ${ago(c.last_used)}`), c.revoked_at || c.is_admin ? null : modeSelect(c)),
     c.revoked_at ? null : h('button', { class: 'small danger', onclick: () => confirmDo(`Revoke token "${c.client_id}"?` + (c.is_admin ? ' This is an OWNER token.' : ''), async () => { await api(`/clients/${encodeURIComponent(c.client_id)}/revoke`, { body: {} }); toast('Token revoked'); render(); }) }, 'Revoke')));
   const oa = oauth.map((c) => h('div', { class: 'item' },
     h('div', { class: 'main' }, h('div', { class: 'name' }, c.client_name, ' ', h('span', { class: 'pill ' + (c.active_grants ? 'ok' : '') }, c.active_grants ? 'authorized' : 'no active grant')),
-      h('div', { class: 'sub' }, `OAuth · registered ${ago(c.created_at)} · last used ${ago(c.last_used)}`)),
+      h('div', { class: 'sub' }, `OAuth · registered ${ago(c.created_at)} · last used ${ago(c.last_used)}`), modeSelect(c)),
     h('button', { class: 'small danger', onclick: () => confirmDo(`Remove "${c.client_name}"? It must be approved again to reconnect.`, async () => { await api(`/oauth/${encodeURIComponent(c.client_id)}/revoke`, { body: {} }); toast('Client removed'); render(); }) }, 'Remove')));
   root.replaceChildren(h('h2', {}, 'OAuth clients'), ...(oa.length ? oa : [h('p', { class: 'muted' }, 'None')]), h('h2', {}, 'Static tokens'), ...(stat.length ? stat : [h('p', { class: 'muted' }, 'None')]));
 }

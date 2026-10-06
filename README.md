@@ -67,6 +67,12 @@ node agent/agent.js            # or: bash deploy/install-macos.sh  (LaunchAgent)
 
 Sign-in locks for 15 minutes after 5 wrong codes, a code can be used once, sessions expire after 30 min idle / 12 h, writes need a CSRF token.
 
+### Tool exposure (for clients that never refresh their tool list)
+Some MCP clients (e.g. Hermes) call `tools/list` once and never again, so the list must not depend on runtime state. By default (per-client *fixed* mode):
+- `tools/list` = `devices_list`, `device_select`, `tools_list`, `tool_call` + the built-in Desktop Commander tools (a snapshot stored on the gateway, so it is identical whether or not a device is online or selected).
+- Tools of servers added in the console (`chrome_*`, custom) are **not** listed. The model discovers them with `tools_list` and runs them with `tool_call {name, arguments, device_id}`; they work the moment they are added, with no reconnect. Audit records the inner tool name.
+- Clients that do refresh can be switched to *live* mode in the console (Clients tab), where `tools/list` shows everything the selected device exposes right now. `?tools=all|stable` on the MCP URL overrides the setting per connection.
+
 ### Adding MCP servers to a device
 Console → Devices → *MCP servers* → *Add an MCP server*. The gateway stores the list and pushes it to the agent whenever it connects or you change it.
 - **Templates** (`agent/backends.js`) are chosen by the agent: the console sends only `{template, params}`, so it cannot inject flags like `--executablePath`. Risky tools (`evaluate_script`, `upload_file`, …) start disabled; tick them on per tool.

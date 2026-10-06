@@ -60,7 +60,7 @@ test('initialize + tools/list + select + call relays to device', async () => {
 
   const list = await rpc('tools/list');
   const names = list.body.result.tools.map((t) => t.name);
-  assert.deepEqual(names.sort(), ['device_select', 'devices_list', 'echo']);
+  assert.deepEqual(names.sort(), ['device_select', 'devices_list', 'echo', 'tool_call', 'tools_list'], 'default list = meta tools + built-in snapshot');
 
   const devs = JSON.parse((await rpc('tools/call', { name: 'devices_list' })).body.result.content[0].text);
   assert.equal(devs[0].status, 'online');

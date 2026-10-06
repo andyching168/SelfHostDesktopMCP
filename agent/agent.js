@@ -192,7 +192,7 @@ async function connect() {
     ws.send(JSON.stringify({
       type: 'hello', device_id: cfg.device_id, protocol_version: PROTOCOL_VERSION,
       name: cfg.name, platform: `${process.platform}-${process.arch}`, hostname: os.hostname(),
-      tools: exposedTools(), custom_backends: policy.allow_custom_backends,
+      tools: exposedTools(), builtin_tools: [...routes.values()].filter((r) => r.slot.builtin).map((r) => r.tool), custom_backends: policy.allow_custom_backends,
     }));
     tx({ type: 'backends_status', backends: statusList() });
     pingTimer = setInterval(() => ws.readyState === 1 && ws.send(JSON.stringify({ type: 'ping' })), PING_MS);
