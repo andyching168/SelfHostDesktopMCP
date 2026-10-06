@@ -37,6 +37,12 @@ switch (cmd) {
     console.log(db.prepare('UPDATE client_tokens SET revoked_at=? WHERE client_id=? AND revoked_at IS NULL').run(now(), id).changes, 'revoked');
     break;
   case 'pair': await pairInteractive(Number(flagVal('--minutes', 3))); break;
+  case 'totp-reset':
+    db.prepare("DELETE FROM settings WHERE key IN ('totp_secret','totp_pending','totp_last_step')").run();
+    db.prepare('DELETE FROM web_sessions').run();
+    console.log('two-step login reset; open /admin/setup to enroll a new authenticator'); break;
+  case 'totp-status':
+    console.log(db.prepare("SELECT 1 FROM settings WHERE key='totp_secret'").get() ? 'enabled' : 'not set up'); break;
   case 'pair-close': setWindow(0); console.log('pairing window closed'); break;
   case 'list':
     console.table(db.prepare('SELECT device_id,name,platform,last_seen,revoked_at FROM devices').all());

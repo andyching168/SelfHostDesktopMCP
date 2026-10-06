@@ -16,6 +16,7 @@ MCP client ──HTTPS /mcp──▶ gateway ◀──WSS /device── agent �
 ## Features
 - **MCP Streamable HTTP** at `/mcp` (JSON responses), tool calls relayed to the chosen device; per-device tool lists.
 - **Auth**: static bearer tokens for clients; **OAuth 2.1** (dynamic client registration, PKCE S256, refresh rotation, RFC 8414/9728 metadata) for connectors such as ChatGPT. Consent needs an admin ("owner") token.
+- **Web admin console** at `/admin/` (mobile-friendly): devices, clients/OAuth grants, activity log, pairing approval. Sign-in is **TOTP only** (any authenticator app), enrolled by scanning a QR in your own browser.
 - **Per-device secrets**, stored only as SHA-256 hashes; instant revocation (live connection is dropped).
 - **Pairing**: `/pair/*` does not exist until you open a 3-minute window from the CLI; approve the request in the terminal.
 - **Routing that works with stateless clients**: pass `device_id` on any call; `device_select` sets a per-client default.
@@ -58,6 +59,13 @@ node agent/agent.js pair https://mcp.example.com --device-id my-laptop
 node agent/agent.js            # or: bash deploy/install-macos.sh  (LaunchAgent) / deploy/*.service.in (systemd)
 ```
 
+### Web console and two-step login
+1. Open `https://mcp.example.com/admin/setup` (only exists until two-step login is enabled), enter the owner token (`secrets/owner-token`).
+2. Scan the QR with an authenticator app, type the 6-digit code to confirm. The secret is shown once and never leaves your browser/phone.
+3. Sign in at `/admin/` with a code from the app. Lost the phone: `node gateway/admin.js totp-reset` on the gateway host, then enrol again.
+
+Sign-in locks for 15 minutes after 5 wrong codes, a code can be used once, sessions expire after 30 min idle / 12 h, writes need a CSRF token.
+
 ### Revoke
 ```bash
 node gateway/admin.js client-revoke <client_id>     # static client token
@@ -71,7 +79,7 @@ OAuth grants live in `oauth_tokens`; revoke by setting `revoked_at` (see docs/SE
 
 ## Layout
 ```
-gateway/   server.js (HTTP/MCP/WS)  oauth.js  pairing.js  db.js  admin.js (offline CLI)
+gateway/   server.js (HTTP/MCP/WS)  oauth.js  pairing.js  web.js + ui/ (admin console)  totp.js  db.js  admin.js (offline CLI)
 agent/     agent.js (device side)   policy.js (guardrails)
 deploy/    install-linux.sh  install-macos.sh  update.sh  *.service.in
 test/      e2e, OAuth, pairing and policy tests (node --test)
@@ -85,7 +93,7 @@ test/      e2e, OAuth, pairing and policy tests (node --test)
 Set `"replace_defaults": true` to replace instead of extend. It is a guardrail, not a security boundary.
 
 ## Limits / not done
-Single gateway instance (no HA), SQLite only, no web admin UI, no per-operation human approval, OAuth is single-owner, Windows has no service installer.
+Single gateway instance (no HA), SQLite only, no per-operation human approval, OAuth is single-owner, Windows has no service installer.
 
 ## License
 MIT — see [LICENSE](LICENSE). Provided as is; running an agent that executes commands on your machine is your responsibility (see docs/SECURITY.md).

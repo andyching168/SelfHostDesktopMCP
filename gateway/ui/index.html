@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Remote MCP</title>
+<link rel="stylesheet" href="/admin/style.css">
+</head>
+<body>
+<header class="bar"><strong>Remote MCP</strong><span id="who" class="muted"></span><button id="logout" class="ghost" hidden>Sign out</button></header>
+
+<main id="login" class="card narrow" hidden>
+  <h1>Sign in</h1>
+  <form id="login-form" autocomplete="off">
+    <label for="code">6-digit code from your authenticator</label>
+    <input id="code" name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" placeholder="123456" required>
+    <button type="submit">Sign in</button>
+    <p id="login-msg" class="msg" role="alert"></p>
+  </form>
+  <p id="enroll" class="muted" hidden>Two-step login is not set up yet. <a href="/admin/setup">Set it up</a>.</p>
+</main>
+
+<div id="app" hidden>
+  <nav class="tabs" role="tablist">
+    <button data-tab="devices" class="active">Devices</button>
+    <button data-tab="clients">Clients</button>
+    <button data-tab="audit">Activity</button>
+    <button data-tab="pairing">Pairing</button>
+  </nav>
+  <p id="toast" class="toast" role="status" hidden></p>
+  <section id="tab-devices"></section>
+  <section id="tab-clients" hidden></section>
+  <section id="tab-audit" hidden></section>
+  <section id="tab-pairing" hidden></section>
+</div>
+<script src="/admin/app.js"></script>
+</body>
+</html>

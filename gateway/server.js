@@ -5,6 +5,7 @@ import { WebSocketServer } from 'ws';
 import { openDb, sha256, now } from './db.js';
 import { createOAuth } from './oauth.js';
 import { createPairing } from './pairing.js';
+import { createWeb } from './web.js';
 
 const VERSION = '0.1.0';
 const PROTOCOL_VERSION = 1;
@@ -232,6 +233,13 @@ async function handleMcp(req, res) {
   }
 }
 
+function revokeDevice(id) {
+  const n = db.prepare('UPDATE devices SET revoked_at=? WHERE device_id=? AND revoked_at IS NULL').run(now(), id).changes;
+  devices.get(id)?.ws.close(4003, 'revoked'); // drop the live connection; the agent exits on 4003
+  return n;
+}
+const web = createWeb({ db, publicUrl: cfg.publicUrl, log, devices, listDevices, revokeDevice });
+
 // ---- management API (admin token required) ---------------------------------
 async function handleApi(req, res, url) {
   // Reached through a reverse proxy (it adds forwarding headers)? Then the management API does not exist.
@@ -242,9 +250,7 @@ async function handleApi(req, res, url) {
   if (req.method === 'GET' && url.pathname === '/api/devices') return json(res, 200, listDevices());
   const m = /^\/api\/devices\/([^/]+)\/revoke$/.exec(url.pathname);
   if (req.method === 'POST' && m) {
-    const id = decodeURIComponent(m[1]);
-    const n = db.prepare('UPDATE devices SET revoked_at=? WHERE device_id=? AND revoked_at IS NULL').run(now(), id).changes;
-    devices.get(id)?.ws.close(4003, 'revoked');
+    const n = revokeDevice(decodeURIComponent(m[1]));
     return json(res, n ? 200 : 404, { revoked: n > 0 });
   }
   json(res, 404, { error: 'not found' });
@@ -255,6 +261,7 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://x');
     if (url.pathname === '/health') return json(res, 200, { status: 'ok', version: VERSION });
+    if (await web.handle(req, res, url)) return;
     if (await oauth.handle(req, res, url)) return;
     if (await pairing.handle(req, res, url)) return;
     if (url.pathname === '/mcp') {

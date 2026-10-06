@@ -49,6 +49,12 @@ export function openDb(path) {
       expires_at INTEGER NOT NULL,
       status     TEXT NOT NULL DEFAULT 'pending'  -- pending | approved | denied | consumed
     );
+    CREATE TABLE IF NOT EXISTS web_sessions (
+      token_hash TEXT PRIMARY KEY,
+      csrf       TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      last_seen  INTEGER NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS client_defaults (
       client_id  TEXT PRIMARY KEY,
       device_id  TEXT NOT NULL,

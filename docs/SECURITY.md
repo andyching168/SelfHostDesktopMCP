@@ -12,12 +12,17 @@
 | OAuth | PKCE S256 only, exact redirect_uri match, codes single-use (5 min), access 1 h, refresh rotated, consent requires an admin token (5 failures / min global limiter) |
 | Pairing | endpoints 404 unless a window is open (default 3 min, CLI only); secret generated at collection time and returned once; existing device ids cannot be re-paired |
 | Management API `/api/*` | admin token; additionally answers 404 to anything that came through a reverse proxy (`X-Forwarded-For`/`X-Real-IP`) |
+| Web console `/admin` | TOTP-only login (RFC 6238), global lockout 5 failures/15 min, one-time use per time step, HttpOnly + SameSite=Strict + Secure cookie, CSRF token + Origin check on every write, strict CSP (no inline script, no third-party resources), UI renders data via `textContent` only. Enrolment page exists only until enabled and needs the owner token. |
 | Audit log | metadata only; arguments, file contents and output are never stored |
 
 ## Policy layer (agent side)
 Blocks sensitive paths (`~/.ssh`, `~/.gnupg`, cloud credentials, the agent's own config/secrets), makes the agent's own code read-only, denies
 `sudo`, shutdown/reboot, `rm -rf /`-style commands, pipe-to-shell, and disables the backend's `set_config_value`.
 **It is a guardrail.** A caller with a shell can obfuscate commands (encoding, indirection, scripts) and defeat string matching. Real isolation needs a separate OS user, container or VM.
+
+## Web console caveats
+- TOTP is a single factor (something you have). Anyone holding the TOTP seed or your unlocked phone can sign in; the console can revoke devices and approve pairings. Keep the seed out of screenshots and chats.
+- The console is reachable from the internet through your proxy by design. If you do not need it remotely, block `/admin*` at the proxy and use it over a VPN/LAN.
 
 ## Operating tips
 - Expose only 443 through a TLS reverse proxy; bind the gateway to localhost (or a LAN address only the proxy can reach). Never expose the backend MCP server or the agent.
