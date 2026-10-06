@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 git fetch -q origin
 BEFORE=$(git rev-parse --short HEAD)
-git pull --ff-only -q
+git pull --ff-only -q origin "$(git rev-parse --abbrev-ref HEAD)"
 AFTER=$(git rev-parse --short HEAD)
 [ "$BEFORE" != "$AFTER" ] && git log --oneline "$BEFORE..$AFTER" || echo "already up to date ($AFTER)"
 npm install --omit=dev --silent
