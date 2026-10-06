@@ -93,7 +93,7 @@ async function renderDeviceDetail() {
   const draw = () => {
     const t = d.catalog.find((c) => c.id === sel.value); fields.replaceChildren();
     if (t) { desc.textContent = t.description + (t.default_disabled.length ? ` Disabled by default: ${t.default_disabled.join(', ')}.` : ''); for (const p of t.params) fields.append(h('label', { class: 'check' }, h('input', { type: 'checkbox', 'data-param': p.key, checked: !!p.default }), ' ' + p.label)); }
-    else { desc.textContent = 'Runs any command as this device\'s user. Prefer a template when one exists.'; fields.append(h('input', { id: 'c-name', placeholder: 'name (a-z, 0-9, -)' }), h('input', { id: 'c-cmd', placeholder: 'command, e.g. npx' }), h('textarea', { id: 'c-args', rows: 3, placeholder: 'one argument per line' })); }
+    else { desc.textContent = 'Runs any command as this device\'s user (it must be installed there; an absolute path is safest). Prefer a template when one exists.'; fields.append(h('input', { id: 'c-name', placeholder: 'name (a-z, 0-9, -)' }), h('input', { id: 'c-cmd', placeholder: 'command, e.g. npx' }), h('textarea', { id: 'c-args', rows: 3, placeholder: 'one argument per line' })); }
   };
   sel.addEventListener('change', draw); draw();
   const add = h('div', { class: 'item col' }, h('div', { class: 'name' }, 'Add an MCP server'), sel, desc, fields,

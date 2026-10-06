@@ -86,12 +86,27 @@ let queue = Promise.resolve();         // reconcile runs one at a time
 
 const withTimeout = (p, ms, msg) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(msg)), ms).unref())]);
 
+// Services (systemd, launchd) start with a minimal PATH, so tools installed by a user (npm -g, cargo, brew, ...) would not be found.
+// Append the usual per-user bin dirs (only those that exist, after the real PATH so nothing is shadowed). device.json "extra_path" adds more.
+const home = os.homedir();
+const EXTRA_BIN = ['.npm-global/bin', '.local/bin', '.bun/bin', '.cargo/bin', '.volta/bin', 'go/bin', 'bin'].map((d) => path.join(home, d))
+  .concat(['/opt/homebrew/bin', '/usr/local/bin', '/home/linuxbrew/.linuxbrew/bin', path.dirname(process.execPath)], Array.isArray(cfg.extra_path) ? cfg.extra_path : []);
+const childPath = () => [...new Set([...(process.env.PATH || '').split(path.delimiter).filter(Boolean), ...EXTRA_BIN.filter((d) => fs.existsSync(d))])].join(path.delimiter);
+// the MCP SDK passes only a few variables by default; desktop-automation servers need the session ones
+const PASS_ENV = ['DISPLAY', 'XAUTHORITY', 'WAYLAND_DISPLAY', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS', 'XDG_SESSION_TYPE', 'XDG_CURRENT_DESKTOP', 'LANG', 'LC_ALL'];
+const childEnv = () => ({ PATH: childPath(), ...Object.fromEntries(PASS_ENV.filter((k) => process.env[k]).map((k) => [k, process.env[k]])) });
+
 async function connectStdio(command, onExit) {
   const [cmd, ...cmdArgs] = command;
-  const transport = new StdioClientTransport({ command: cmd, args: cmdArgs, stderr: 'inherit' });
+  const transport = new StdioClientTransport({ command: cmd, args: cmdArgs, env: childEnv(), stderr: 'inherit' });
   const client = new Client({ name: 'remote-mcp-agent', version: '0.1.0' }, { capabilities: {} });
   try { await withTimeout(client.connect(transport), START_TIMEOUT_MS, 'start timed out'); }
-  catch (e) { await client.close().catch(() => {}); throw e; }
+  catch (e) {
+    await client.close().catch(() => {});
+    if (e?.code === 'ENOENT' || /ENOENT/.test(e?.message || ''))
+      throw new Error(`command "${cmd}" not found on this device. Use its absolute path, or add its folder to "extra_path" in ~/.config/remote-mcp/device.json`);
+    throw e;
+  }
   transport.onclose = () => { if (!shuttingDown) onExit(); };
   return {
     listTools: async () => (await client.listTools()).tools,

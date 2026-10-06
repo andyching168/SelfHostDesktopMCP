@@ -26,9 +26,9 @@ async function mcp(method, params, mode = 'all') { // 'all' = live list (the old
 }
 const toolNames = async () => (await mcp('tools/list')).tools.map((t) => t.name);
 async function until(fn, ms = 20000) { const t = Date.now(); for (;;) { const v = await fn(); if (v) return v; if (Date.now() - t > ms) throw new Error('timeout waiting'); await sleep(250); } }
-function startAgent(id, secretVal, policy) {
+function startAgent(id, secretVal, policy, extra = {}) {
   const cfg = path.join(tmp, `${id}.json`);
-  fs.writeFileSync(cfg, JSON.stringify({ gateway: `ws://127.0.0.1:${PORT}/device`, device_id: id, device_secret: secretVal }), { mode: 0o600 });
+  fs.writeFileSync(cfg, JSON.stringify({ gateway: `ws://127.0.0.1:${PORT}/device`, device_id: id, device_secret: secretVal, ...extra }), { mode: 0o600 });
   if (policy) fs.writeFileSync(path.join(tmp, `${id}.policy.json`), JSON.stringify(policy));
   const p = spawn('node', ['agent/agent.js', '--config', cfg, '--mock', ...(policy ? ['--policy', path.join(tmp, `${id}.policy.json`)] : ['--policy', path.join(tmp, 'none.json')])], { stdio: 'pipe' });
   procs.push(p); return p;
@@ -140,6 +140,21 @@ test('a server that fails to start reports an error instead of hanging', async (
   await api('/devices/bz/backends', { template: 'custom', name: 'broken', params: { command: 'definitely-not-a-real-binary-xyz', args: [] } });
   const sv = await until(async () => { const x = (await api('/devices/bz/backends')).body.servers.find((q) => q.name === 'broken'); return x?.status === 'error' && x; });
   assert.ok(sv.error);
+  assert.match(sv.error, /not found on this device/, 'a missing command explains itself instead of a bare ENOENT');
+});
+
+test('commands installed outside the service PATH are found via extra_path (e.g. npm -g in ~/.npm-global/bin)', async () => {
+  const bin = path.join(tmp, 'userbin'); fs.mkdirSync(bin);
+  fs.writeFileSync(path.join(bin, 'my-mcp-tool'), `#!/bin/sh\nexec node "${FIXTURE}"\n`, { mode: 0o755 });
+  const s = grab(admin('device-create', 'bp'), 'device_secret');
+  startAgent('bp', s, { allow_custom_backends: true }, {}); // 1) without extra_path the bare name is not found
+  await until(async () => (await api('/devices')).body.find((d) => d.device_id === 'bp')?.status === 'online');
+  await api('/devices/bp/backends', { template: 'custom', name: 'user-tool', params: { command: 'my-mcp-tool', args: [] } });
+  assert.match((await until(async () => { const x = (await api('/devices/bp/backends')).body.servers.find((q) => q.name === 'user-tool'); return x?.status === 'error' && x; })).error, /not found/);
+  procs[procs.findIndex((p) => p.spawnargs.some((a) => a.endsWith('bp.json')))].kill();
+  await until(async () => (await api('/devices')).body.find((d) => d.device_id === 'bp').status === 'offline');
+  startAgent('bp', s, { allow_custom_backends: true }, { extra_path: [bin] }); // 2) with it, the same stored config now starts
+  assert.equal((await until(async () => { const x = (await api('/devices/bp/backends')).body.servers.find((q) => q.name === 'user-tool'); return x?.status === 'running' && x; })).tools.length, 3);
 });
 
 test('stable mode: tools/list never changes, add-on servers are reached with tools_list + tool_call', async () => {
