@@ -178,6 +178,7 @@ export function createWeb({ db, publicUrl, log, devices, listDevices, revokeDevi
             db.prepare('UPDATE device_backends SET enabled_tools=? WHERE device_id=? AND name=?').run(t === null ? null : JSON.stringify(t), did, name);
           }
         }
+        if (mm[3] === 'update') log('INFO', `web admin: updated MCP server ${name} on ${did}` + (typeof m.enabled === 'boolean' ? ` enabled=${m.enabled}` : '') + ('enabled_tools' in m ? ` tools=${m.enabled_tools === null ? 'defaults' : m.enabled_tools.length}` : ''));
         pushConfig(did);
         return sendJson(res, 200, { ok: true }), true;
       }
