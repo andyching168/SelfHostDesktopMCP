@@ -83,3 +83,6 @@ Set `"replace_defaults": true` to replace instead of extend. It is a guardrail, 
 
 ## Limits / not done
 Single gateway instance (no HA), SQLite only, no web admin UI, no per-operation human approval, OAuth is single-owner, Windows has no service installer.
+
+## License
+MIT — see [LICENSE](LICENSE). Provided as is; running an agent that executes commands on your machine is your responsibility (see docs/SECURITY.md).
