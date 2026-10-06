@@ -38,6 +38,8 @@ test('resolveBackend: catalog is fixed, params are validated, custom needs local
   const r = resolveBackend({ template: 'chrome-devtools', name: 'chrome-devtools', params: { headless: true } }, {});
   assert.deepEqual(r.command, ['npx', '-y', 'chrome-devtools-mcp@latest', '--isolated', '--headless']);
   assert.ok(r.defaultDisabled.includes('evaluate_script'));
+  assert.deepEqual(resolveBackend({ template: 'chrome-devtools', name: 'chrome-devtools', params: { autoConnect: true, headless: true } }, {}).command, ['npx', '-y', 'chrome-devtools-mcp@latest', '--autoConnect']);
+  assert.deepEqual(resolveBackend({ template: 'chrome-devtools', name: 'chrome-devtools', params: {} }, {}).command.slice(3), ['--isolated'], 'defaults stay isolated');
   assert.deepEqual(resolveBackend({ template: 'playwright', name: 'playwright', params: {} }, {}).command.slice(0, 3), ['npx', '-y', '@playwright/mcp@latest']);
   // nothing the console sends can inject flags such as --executablePath
   const sneaky = resolveBackend({ template: 'chrome-devtools', name: 'chrome-devtools', params: { headless: false, executablePath: '/bin/sh', args: ['--executablePath=/bin/sh'] } }, {});

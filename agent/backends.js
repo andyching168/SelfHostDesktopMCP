@@ -5,10 +5,14 @@
 export const CATALOG = {
   'chrome-devtools': {
     title: 'Chrome DevTools',
-    description: 'Drive and inspect Chrome: pages, DOM snapshots, screenshots, network, console. Uses a throw-away profile, never your real one.',
+    description: 'Drive and inspect Chrome: pages, DOM snapshots, screenshots, network, console. By default it launches a throw-away profile; with autoConnect it attaches to the Chrome you are already running.',
     package: 'chrome-devtools-mcp', prefix: 'chrome_',
-    params: [{ key: 'headless', label: 'Headless (no visible window)', type: 'boolean', default: false }],
-    args: (p) => ['--isolated', ...(p.headless ? ['--headless'] : [])],
+    params: [
+      { key: 'autoConnect', label: 'Use my running Chrome (--autoConnect): your real profile and logged-in sessions', type: 'boolean', default: false },
+      { key: 'headless', label: 'Headless (no visible window; ignored with autoConnect)', type: 'boolean', default: false },
+    ],
+    // --autoConnect attaches to an existing browser, so it replaces --isolated/--headless (which only apply to a browser it launches itself)
+    args: (p) => (p.autoConnect ? ['--autoConnect'] : ['--isolated', ...(p.headless ? ['--headless'] : [])]),
     default_disabled: ['evaluate_script', 'upload_file'], // arbitrary JS in the page / reading local files into a page
   },
   playwright: {
