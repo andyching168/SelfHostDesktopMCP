@@ -1,7 +1,7 @@
 'use strict';
 // No innerHTML anywhere: every value (hostnames, tool names, ...) is untrusted and goes through textContent.
 const $ = (s, r = document) => r.querySelector(s);
-let csrf = null, tab = 'devices', timer = null;
+let csrf = null, tab = 'devices', timer = null, detail = null;
 
 function h(tag, props, ...kids) {
   const e = document.createElement(tag);
@@ -52,12 +52,62 @@ function render() {
 
 // ---- devices ----
 async function renderDevices() {
+  if (detail) return renderDeviceDetail();
   const list = await api('/devices'), root = $('#tab-devices'), items = [];
   for (const d of list) items.push(h('div', { class: 'item' },
     h('div', { class: 'main' }, h('div', { class: 'name' }, h('span', { class: 'dot' + (d.status === 'online' ? ' on' : '') }), d.name || d.device_id),
       h('div', { class: 'sub' }, `${d.device_id} · ${d.platform || '?'} · ${d.hostname || '?'} · ${d.status === 'online' ? 'online' : 'last seen ' + ago(d.last_seen)}`)),
+    h('button', { class: 'small', onclick: () => { detail = d.device_id; render(); } }, 'MCP servers'),
     h('button', { class: 'small danger', onclick: () => confirmDo(`Revoke ${d.device_id}? It is disconnected now and cannot reconnect.`, async () => { await api(`/devices/${encodeURIComponent(d.device_id)}/revoke`, { body: {} }); toast('Device revoked'); render(); }) }, 'Revoke')));
   root.replaceChildren(...(items.length ? items : [h('p', { class: 'muted' }, 'No devices yet. Use the Pairing tab to add one.')]));
+}
+
+// ---- device detail: MCP servers ----
+const openTools = new Set();
+const pillFor = (st) => h('span', { class: 'pill ' + (st === 'running' ? 'ok' : st === 'error' ? 'err' : '') }, st);
+async function renderDeviceDetail() {
+  const root = $('#tab-devices');
+  const d = await api(`/devices/${encodeURIComponent(detail)}/backends`), base = `/devices/${encodeURIComponent(detail)}/backends`;
+  const act = (path, body, msg) => async () => { try { await api(base + path, { body }); if (msg) toast(msg); render(); } catch (e) { toast(e.message, true); } };
+
+  const rows = d.servers.map((sv) => {
+    const eff = new Set(sv.enabled_tools || []);
+    const toolsOpen = openTools.has(sv.name) && sv.tools.length;
+    const checks = toolsOpen && !sv.builtin ? sv.tools.map((t) => h('label', { class: 'check' }, h('input', { type: 'checkbox', 'data-tool': t.name, checked: eff.has(t.name) }), ' ', h('b', {}, t.name), h('span', { class: 'sub' }, ' ' + (t.description || '').split('\n')[0]))) : [];
+    return h('div', { class: 'item col' },
+      h('div', { class: 'row' },
+        h('div', { class: 'main' }, h('div', { class: 'name' }, sv.name, ' ', pillFor(sv.status), ' ', sv.builtin ? h('span', { class: 'pill' }, 'built-in') : null),
+          h('div', { class: 'sub' }, sv.error ? h('span', { class: 'warn' }, sv.error) : `${sv.tools.length} tools${sv.prefix ? ' · prefix ' + sv.prefix : ''}${sv.builtin ? '' : ' · ' + sv.template}`)),
+        sv.tools.length ? h('button', { class: 'small ghost', onclick: () => { openTools.has(sv.name) ? openTools.delete(sv.name) : openTools.add(sv.name); render(); } }, toolsOpen ? 'Hide tools' : 'Tools') : null,
+        sv.builtin ? null : h('button', { class: 'small ghost', onclick: act(`/${encodeURIComponent(sv.name)}/update`, { enabled: !sv.enabled }) }, sv.enabled ? 'Disable' : 'Enable'),
+        sv.builtin ? null : h('button', { class: 'small danger', onclick: () => confirmDo(`Remove ${sv.name} from this device?`, act(`/${encodeURIComponent(sv.name)}/remove`, {}, 'Removed')) }, 'Remove')),
+      toolsOpen && !sv.builtin ? h('div', { class: 'tools' }, ...checks,
+        h('div', { class: 'row' },
+          h('button', { class: 'small', onclick: async (e) => { const names = [...e.target.closest('.tools').querySelectorAll('input[data-tool]')].filter((i) => i.checked).map((i) => i.dataset.tool); await act(`/${encodeURIComponent(sv.name)}/update`, { enabled_tools: names }, 'Tools saved')(); } }, 'Save'),
+          h('button', { class: 'small ghost', onclick: act(`/${encodeURIComponent(sv.name)}/update`, { enabled_tools: null }, 'Reset to defaults') }, 'Reset to defaults'))) : null);
+  });
+
+  // add form
+  const sel = h('select', {}, ...d.catalog.map((t) => h('option', { value: t.id }, t.title)), d.device.custom_backends ? h('option', { value: 'custom' }, 'Custom command…') : null);
+  const desc = h('p', { class: 'sub' }), fields = h('div', {});
+  const draw = () => {
+    const t = d.catalog.find((c) => c.id === sel.value); fields.replaceChildren();
+    if (t) { desc.textContent = t.description + (t.default_disabled.length ? ` Disabled by default: ${t.default_disabled.join(', ')}.` : ''); for (const p of t.params) fields.append(h('label', { class: 'check' }, h('input', { type: 'checkbox', 'data-param': p.key, checked: !!p.default }), ' ' + p.label)); }
+    else { desc.textContent = 'Runs any command as this device\'s user. Prefer a template when one exists.'; fields.append(h('input', { id: 'c-name', placeholder: 'name (a-z, 0-9, -)' }), h('input', { id: 'c-cmd', placeholder: 'command, e.g. npx' }), h('textarea', { id: 'c-args', rows: 3, placeholder: 'one argument per line' })); }
+  };
+  sel.addEventListener('change', draw); draw();
+  const add = h('div', { class: 'item col' }, h('div', { class: 'name' }, 'Add an MCP server'), sel, desc, fields,
+    h('div', { class: 'row' }, h('button', { class: 'small', onclick: async () => {
+      const body = { template: sel.value, params: {} };
+      if (sel.value === 'custom') { body.name = $('#c-name').value.trim(); body.params = { command: $('#c-cmd').value.trim(), args: $('#c-args').value.split('\n').map((x) => x.trim()).filter(Boolean) }; }
+      else fields.querySelectorAll('[data-param]').forEach((i) => (body.params[i.dataset.param] = i.checked));
+      try { await api(base, { body }); toast('Added. The device is starting it (first run may download the package).'); render(); } catch (e) { toast(e.message, true); }
+    } }, 'Add'), d.device.online ? null : h('span', { class: 'sub' }, 'Device is offline: it will start when it reconnects.')));
+
+  root.replaceChildren(
+    h('div', { class: 'row' }, h('button', { class: 'small ghost', onclick: () => { detail = null; render(); } }, '← Devices'), h('div', { class: 'name' }, d.device.name || d.device.device_id, ' ', h('span', { class: 'pill ' + (d.device.online ? 'ok' : '') }, d.device.online ? 'online' : 'offline'))),
+    h('h2', {}, 'MCP servers on this device'), ...rows, add);
+  if (d.servers.some((x) => x.status === 'starting' || x.status === 'waiting for agent')) { clearTimeout(renderDeviceDetail.t); renderDeviceDetail.t = setTimeout(() => detail && tab === 'devices' && renderDeviceDetail().catch(() => {}), 3000); }
 }
 
 // ---- clients ----
@@ -82,11 +132,11 @@ async function renderAudit() {
   const input = (k, ph) => h('input', { placeholder: ph, value: filt[k], onchange: (e) => { filt[k] = e.target.value.trim(); renderAudit(); } });
   const status = h('select', { onchange: (e) => { filt.status = e.target.value; renderAudit(); } }, ...['', 'success', 'error'].map((v) => h('option', { value: v, selected: filt.status === v }, v || 'any status')));
   const cell = (r, k) => h('td', {}, r[k] ?? '');
-  const table = h('div', { class: 'scroll' }, h('table', {}, h('thead', {}, h('tr', {}, ...['time', 'client', 'device', 'tool', 'ms', 'status'].map((c) => h('th', {}, c)))),
+  const table = h('div', { class: 'scroll' }, h('table', {}, h('thead', {}, h('tr', {}, ...['time', 'client', 'device', 'tool', 'ms', 'status', 'detail'].map((c) => h('th', {}, c)))),
     h('tbody', {}, ...rows.map((r) => h('tr', {}, h('td', {}, new Date(r.timestamp).toLocaleString()), cell(r, 'client_id'), cell(r, 'device_id'), cell(r, 'tool'), cell(r, 'duration_ms'),
-      h('td', {}, h('span', { class: 'pill ' + (r.status === 'success' ? 'ok' : 'err') }, r.error_code || r.status)))))));
+      h('td', {}, h('span', { class: 'pill ' + (r.status === 'success' ? 'ok' : 'err') }, r.error_code || r.status)), h('td', { class: 'sub' }, r.error_detail || ''))))));
   root.replaceChildren(h('div', { class: 'filters' }, input('client', 'client'), input('device', 'device'), input('tool', 'tool'), status), rows.length ? table : h('p', { class: 'muted' }, 'No matching activity.'),
-    h('p', { class: 'muted' }, 'Metadata only. Arguments and output are never stored.'));
+    h('p', { class: 'muted' }, 'Metadata only. Arguments and output are never stored; policy denials keep just the reason.'));
 }
 
 // ---- pairing ----

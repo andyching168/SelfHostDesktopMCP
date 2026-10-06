@@ -73,9 +73,10 @@ class RelayError extends Error {
 // ---- audit ----------------------------------------------------------------
 function audit(e) {
   // Deliberately metadata only: never arguments, file contents or stdout.
-  db.prepare(`INSERT INTO audit_logs (timestamp,client_id,device_id,tool,request_id,duration_ms,status,error_code)
-              VALUES (?,?,?,?,?,?,?,?)`).run(now(), e.client_id, e.device_id ?? null, e.tool, e.request_id ?? null,
-    e.duration_ms, e.status, e.error_code ?? null);
+  // error_detail is kept only for policy denials: the reason (a path or program name), never arguments or output.
+  db.prepare(`INSERT INTO audit_logs (timestamp,client_id,device_id,tool,request_id,duration_ms,status,error_code,error_detail)
+              VALUES (?,?,?,?,?,?,?,?,?)`).run(now(), e.client_id, e.device_id ?? null, e.tool, e.request_id ?? null,
+    e.duration_ms, e.status, e.error_code ?? null, e.error_detail ?? null);
 }
 
 // ---- MCP (Streamable HTTP, JSON responses) ---------------------------------
@@ -146,7 +147,7 @@ async function callTool(ctx, params, rpcId) {
   const { client, session } = ctx;
   const t0 = Date.now();
   const tool = params.name;
-  let deviceId = null, status = 'success', errCode = null, request_id = null;
+  let deviceId = null, status = 'success', errCode = null, request_id = null, detail = null;
   try {
     if (tool === 'devices_list') {
       return { content: [{ type: 'text', text: JSON.stringify(listDevices(), null, 2) }] };
@@ -174,9 +175,10 @@ async function callTool(ctx, params, rpcId) {
   } catch (e) {
     if (!(e instanceof RelayError) && !e.code) throw e;
     status = 'error'; errCode = e.code; request_id = e.request_id ?? null;
+    if (e.code === 'POLICY_DENIED') detail = String(e.message).replace(/^POLICY_DENIED: /, '').replace(/^Blocked by device policy: /, '').slice(0, 200);
     return toolErr(e.code, e.message);
   } finally {
-    audit({ client_id: client.client_id, device_id: deviceId, tool, request_id, duration_ms: Date.now() - t0, status, error_code: errCode });
+    audit({ client_id: client.client_id, device_id: deviceId, tool, request_id, duration_ms: Date.now() - t0, status, error_code: errCode, error_detail: detail });
     log('INFO', `tools/call ${tool} → ${deviceId ?? '-'} ${status} ${Date.now() - t0} ms`);
   }
 }
@@ -233,12 +235,21 @@ async function handleMcp(req, res) {
   }
 }
 
+/** Send the console-managed MCP server list to a connected agent (it reconciles: start/stop/update). */
+function pushConfig(deviceId) {
+  const dev = devices.get(deviceId); if (!dev) return false;
+  const backends = db.prepare('SELECT name,template,params,enabled,enabled_tools FROM device_backends WHERE device_id=? ORDER BY created_at').all(deviceId)
+    .map((r) => ({ name: r.name, template: r.template, params: JSON.parse(r.params), enabled: !!r.enabled, enabled_tools: r.enabled_tools ? JSON.parse(r.enabled_tools) : null }));
+  dev.ws.send(JSON.stringify({ type: 'config', backends }));
+  return true;
+}
+
 function revokeDevice(id) {
   const n = db.prepare('UPDATE devices SET revoked_at=? WHERE device_id=? AND revoked_at IS NULL').run(now(), id).changes;
   devices.get(id)?.ws.close(4003, 'revoked'); // drop the live connection; the agent exits on 4003
   return n;
 }
-const web = createWeb({ db, publicUrl: cfg.publicUrl, log, devices, listDevices, revokeDevice });
+const web = createWeb({ db, publicUrl: cfg.publicUrl, log, devices, listDevices, revokeDevice, pushConfig });
 
 // ---- management API (admin token required) ---------------------------------
 async function handleApi(req, res, url) {
@@ -303,11 +314,12 @@ function onDevice(ws, row) {
       clearTimeout(helloTimer);
       devices.get(deviceId)?.ws.close(4000, 'replaced'); // newest connection wins
       const session_id = crypto.randomUUID();
-      dev = { ws, sessionId: session_id, lastSeen: Date.now(), tools: m.tools ?? [], pending: new Map() };
+      dev = { ws, sessionId: session_id, lastSeen: Date.now(), tools: m.tools ?? [], pending: new Map(), backends: [], custom: m.custom_backends === true };
       devices.set(deviceId, dev);
       db.prepare('UPDATE devices SET name=COALESCE(?,name), platform=?, hostname=?, capabilities=?, last_seen=? WHERE device_id=?')
         .run(m.name ?? null, m.platform ?? null, m.hostname ?? null, JSON.stringify((dev.tools).map((t) => t.name)), now(), deviceId);
       ws.send(JSON.stringify({ type: 'hello_ack', session_id }));
+      pushConfig(deviceId);
       log('INFO', `device ${deviceId} connected (${dev.tools.length} tools)`);
       return;
     }
@@ -316,7 +328,8 @@ function onDevice(ws, row) {
       db.prepare('UPDATE devices SET last_seen=? WHERE device_id=?').run(now(), deviceId);
       return ws.send(JSON.stringify({ type: 'pong' }));
     }
-    if (m.type === 'tools_changed') { dev.tools = m.tools ?? dev.tools; return; }
+    if (m.type === 'tools_changed') { if (Array.isArray(m.tools)) dev.tools = m.tools; return; }
+    if (m.type === 'backends_status') { if (Array.isArray(m.backends)) dev.backends = m.backends.slice(0, 20); return; }
     if (m.type === 'response') {
       const p = dev.pending.get(m.request_id);
       if (!p) return;

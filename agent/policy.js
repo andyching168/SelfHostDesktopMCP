@@ -46,6 +46,7 @@ export function loadPolicy(file) {
     blockedReal: p.blocked_paths.map((x) => ({ raw: x, abs: real(x) })),
     readonlyReal: p.readonly_paths.map((x) => ({ raw: x, abs: real(x) })),
     allowedReal: p.allowed_paths.map(real),
+    allow_custom_backends: user.allow_custom_backends === true,
     patterns: p.blocked_patterns.map((x) => new RegExp(x, 'i')),
     cmdRe: new RegExp(`(^|[^\\w.-])(${p.blocked_commands.map((c) => c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})(?![\\w-])`, 'i'),
   };
@@ -66,6 +67,9 @@ export function check(policy, tool, args = {}) {
     if (write) { const r = policy.readonlyReal.find((x) => inside(abs, x.abs)); if (r) return `path ${raw} is read-only (${r.raw})`; }
     if (policy.allowedReal.length && !policy.allowedReal.some((a) => inside(abs, a))) return `path ${raw} is outside allowed_paths`;
   }
+
+  for (const [k, v] of Object.entries(args)) // a browser tool must not be a way around the path rules
+    if (/^url$/i.test(k) && typeof v === 'string' && /^\s*(file|javascript|chrome|chrome-extension|view-source):/i.test(v)) return `${k} uses a blocked scheme`;
 
   const cmd = tool === 'start_process' ? args.command : tool === 'interact_with_process' ? args.input : null;
   if (typeof cmd === 'string') {

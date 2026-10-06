@@ -55,6 +55,16 @@ export function openDb(path) {
       created_at INTEGER NOT NULL,
       last_seen  INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS device_backends (
+      device_id     TEXT NOT NULL,
+      name          TEXT NOT NULL,
+      template      TEXT NOT NULL,
+      params        TEXT NOT NULL DEFAULT '{}',
+      enabled       INTEGER NOT NULL DEFAULT 1,
+      enabled_tools TEXT,          -- JSON array of real tool names, NULL = template defaults
+      created_at    TEXT NOT NULL,
+      PRIMARY KEY (device_id, name)
+    );
     CREATE TABLE IF NOT EXISTS client_defaults (
       client_id  TEXT PRIMARY KEY,
       device_id  TEXT NOT NULL,
@@ -96,5 +106,7 @@ export function openDb(path) {
       error_code  TEXT
     );
   `);
+  // migrations for databases created by older versions
+  if (!db.prepare('PRAGMA table_info(audit_logs)').all().some((c) => c.name === 'error_detail')) db.exec('ALTER TABLE audit_logs ADD COLUMN error_detail TEXT');
   return db;
 }

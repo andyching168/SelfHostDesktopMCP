@@ -20,6 +20,11 @@ Blocks sensitive paths (`~/.ssh`, `~/.gnupg`, cloud credentials, the agent's own
 `sudo`, shutdown/reboot, `rm -rf /`-style commands, pipe-to-shell, and disables the backend's `set_config_value`.
 **It is a guardrail.** A caller with a shell can obfuscate commands (encoding, indirection, scripts) and defeat string matching. Real isolation needs a separate OS user, container or VM.
 
+## MCP servers added from the console
+The console can make a device start more MCP servers, which is a powerful operation, so it is constrained on the device side: templates are fixed in the agent
+(package and flags), custom commands require a local opt-in (`allow_custom_backends` in the device's own `policy.json`, which the default policy makes read-only
+for remote tools), and the policy applies to added servers' tools. Anyone who can sign in to the console can still enable what the device allows.
+
 ## Web console caveats
 - TOTP is a single factor (something you have). Anyone holding the TOTP seed or your unlocked phone can sign in; the console can revoke devices and approve pairings. Keep the seed out of screenshots and chats.
 - The console is reachable from the internet through your proxy by design. If you do not need it remotely, block `/admin*` at the proxy and use it over a VPN/LAN.

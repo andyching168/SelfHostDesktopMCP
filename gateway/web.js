@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import QRCode from 'qrcode';
 import { sha256, now } from './db.js';
 import { newTotpSecret, verifyTotp, otpauthUri } from './totp.js';
+import { CATALOG, NAME_RE } from '../agent/backends.js';
 
 const UI_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'ui');
 const ASSETS = { '/admin/': ['index.html', 'text/html; charset=utf-8'], '/admin/app.js': ['app.js', 'text/javascript; charset=utf-8'], '/admin/style.css': ['style.css', 'text/css; charset=utf-8'] };
@@ -15,7 +16,7 @@ const IDLE_MS = 30 * 60_000, MAX_MS = 12 * 3600_000, LOCK_WINDOW = 15 * 60_000, 
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const safeEq = (a, b) => a.length === b.length && crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
 
-export function createWeb({ db, publicUrl, log, devices, listDevices, revokeDevice }) {
+export function createWeb({ db, publicUrl, log, devices, listDevices, revokeDevice, pushConfig }) {
   const origin = new URL(publicUrl).origin, secure = publicUrl.startsWith('https:');
   const host = new URL(publicUrl).host;
   const fails = [];
@@ -126,6 +127,62 @@ export function createWeb({ db, publicUrl, log, devices, listDevices, revokeDevi
       return sendJson(res, n ? 200 : 404, { revoked: n }), true;
     }
 
+    // ---- per-device MCP servers ----
+    if ((mm = /^\/devices\/([^/]+)\/backends(?:\/([^/]+)\/(update|remove))?$/.exec(p))) {
+      const did = decodeURIComponent(mm[1]);
+      const dev = db.prepare('SELECT device_id,name FROM devices WHERE device_id=? AND revoked_at IS NULL').get(did);
+      if (!dev) return sendJson(res, 404, { error: 'unknown device' }), true;
+      const live = devices.get(did);
+
+      if (req.method === 'GET' && !mm[2]) {
+        const rows = db.prepare('SELECT name,template,params,enabled,enabled_tools FROM device_backends WHERE device_id=? ORDER BY created_at').all(did);
+        const st = new Map((live?.backends ?? []).map((b) => [b.name, b]));
+        const shape = (name, extra) => { const b = st.get(name); return { name, status: live ? (b?.status ?? 'waiting for agent') : 'device offline', error: b?.error ?? null, prefix: b?.prefix ?? '', tools: b?.tools ?? [], enabled_tools: b?.enabled ?? [], ...extra }; };
+        const servers = [shape('desktop-commander', { builtin: true, template: 'builtin', enabled: true, status: live ? (st.get('desktop-commander')?.status ?? 'running') : 'device offline' }),
+          ...rows.map((r) => shape(r.name, { builtin: false, template: r.template, params: JSON.parse(r.params), enabled: !!r.enabled, explicit_tools: r.enabled_tools ? JSON.parse(r.enabled_tools) : null }))];
+        const catalog = Object.entries(CATALOG).map(([id, t]) => ({ id, title: t.title, description: t.description, params: t.params, default_disabled: t.default_disabled }));
+        return sendJson(res, 200, { device: { device_id: did, name: dev.name, online: !!live, custom_backends: !!live?.custom }, catalog, servers }), true;
+      }
+
+      if (req.method === 'POST' && !mm[2]) { // add
+        const template = String(m.template ?? ''), params = m.params && typeof m.params === 'object' ? m.params : {};
+        let name = template;
+        if (template === 'custom') {
+          name = String(m.name ?? '');
+          if (!live) return sendJson(res, 409, { error: 'the device must be online to add a custom server' }), true;
+          if (!live.custom) return sendJson(res, 403, { error: 'custom servers are disabled on this device (allow_custom_backends in its local policy.json)' }), true;
+          if (!NAME_RE.test(name) || ['custom', 'desktop-commander'].includes(name)) return sendJson(res, 400, { error: 'name: lowercase letters, digits, dashes' }), true;
+          const { command, args = [] } = params;
+          if (typeof command !== 'string' || !command.trim() || command.length > 200 || !Array.isArray(args) || args.length > 20 || !args.every((a) => typeof a === 'string' && a.length <= 300)) return sendJson(res, 400, { error: 'command (string) and args (up to 20 strings) required' }), true;
+        } else {
+          const t = CATALOG[template]; if (!t) return sendJson(res, 400, { error: 'unknown template' }), true;
+          for (const d of t.params) if (params[d.key] !== undefined && typeof params[d.key] !== d.type) return sendJson(res, 400, { error: `${d.key} must be ${d.type}` }), true;
+        }
+        if (db.prepare('SELECT COUNT(*) n FROM device_backends WHERE device_id=?').get(did).n >= 10) return sendJson(res, 400, { error: 'at most 10 servers per device' }), true;
+        if (db.prepare('SELECT 1 FROM device_backends WHERE device_id=? AND name=?').get(did, name)) return sendJson(res, 409, { error: 'already added' }), true;
+        db.prepare('INSERT INTO device_backends (device_id,name,template,params,enabled,created_at) VALUES (?,?,?,?,1,?)').run(did, name, template, JSON.stringify(params), now());
+        log('INFO', `web admin: added MCP server ${name} to ${did}`); pushConfig(did);
+        return sendJson(res, 200, { ok: true, name }), true;
+      }
+
+      if (req.method === 'POST' && mm[2]) {
+        const name = decodeURIComponent(mm[2]);
+        const row = db.prepare('SELECT 1 FROM device_backends WHERE device_id=? AND name=?').get(did, name);
+        if (!row) return sendJson(res, 404, { error: 'unknown server' }), true;
+        if (mm[3] === 'remove') { db.prepare('DELETE FROM device_backends WHERE device_id=? AND name=?').run(did, name); log('INFO', `web admin: removed MCP server ${name} from ${did}`); }
+        else {
+          if (typeof m.enabled === 'boolean') db.prepare('UPDATE device_backends SET enabled=? WHERE device_id=? AND name=?').run(m.enabled ? 1 : 0, did, name);
+          if ('enabled_tools' in m) {
+            const t = m.enabled_tools;
+            if (t !== null && !(Array.isArray(t) && t.length <= 300 && t.every((x) => typeof x === 'string' && x.length <= 128))) return sendJson(res, 400, { error: 'enabled_tools must be null or a list of names' }), true;
+            db.prepare('UPDATE device_backends SET enabled_tools=? WHERE device_id=? AND name=?').run(t === null ? null : JSON.stringify(t), did, name);
+          }
+        }
+        pushConfig(did);
+        return sendJson(res, 200, { ok: true }), true;
+      }
+    }
+
     if (p === '/clients' && req.method === 'GET') {
       const last = (cid) => db.prepare('SELECT MAX(timestamp) t FROM audit_logs WHERE client_id=?').get(cid).t;
       const statics = db.prepare('SELECT client_id,is_admin,created_at,revoked_at FROM client_tokens ORDER BY created_at').all().map((c) => ({ ...c, last_used: last(c.client_id) }));
@@ -147,9 +204,9 @@ export function createWeb({ db, publicUrl, log, devices, listDevices, revokeDevi
     if (p === '/audit' && req.method === 'GET') {
       const q = url.searchParams, where = [], args = [];
       for (const [k, col] of [['client', 'client_id'], ['device', 'device_id'], ['status', 'status']]) if (q.get(k)) { where.push(`${col}=?`); args.push(q.get(k)); }
-      if (q.get('tool')) { where.push('tool LIKE ?'); args.push(`%${q.get('tool').replace(/[%_]/g, '')}%`); }
+      if (q.get('tool')) { where.push("tool LIKE ? ESCAPE '\\'"); args.push(`%${q.get('tool').replace(/[\\%_]/g, (c) => '\\' + c)}%`); } // escape LIKE wildcards instead of dropping them
       const limit = Math.min(Math.max(Number(q.get('limit')) || 100, 1), 500);
-      const rows = db.prepare(`SELECT id,timestamp,client_id,device_id,tool,request_id,duration_ms,status,error_code FROM audit_logs ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY id DESC LIMIT ?`).all(...args, limit);
+      const rows = db.prepare(`SELECT id,timestamp,client_id,device_id,tool,request_id,duration_ms,status,error_code,error_detail FROM audit_logs ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY id DESC LIMIT ?`).all(...args, limit);
       return sendJson(res, 200, rows), true;
     }
 

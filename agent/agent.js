@@ -9,6 +9,7 @@ import WebSocket from 'ws';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { loadPolicy, check } from './policy.js';
+import { resolveBackend } from './backends.js';
 
 const PROTOCOL_VERSION = 1;
 const PING_MS = 20_000;
@@ -73,32 +74,111 @@ if (process.platform !== 'win32' && fs.statSync(configPath).mode & 0o077) log('W
 
 const policy = loadPolicy(flag('policy', path.join(path.dirname(configPath), 'policy.json')));
 
-// ---- local MCP backend ---------------------------------------------------------
+// ---- local MCP backends ---------------------------------------------------------
+// One "slot" per local MCP server. desktop-commander is built in; the rest are requested by the gateway
+// console (see backends.js) and are started/stopped by reconcile(). Tools are exposed as prefix+name.
+const START_TIMEOUT_MS = 120_000;
 let shuttingDown = false;
-let backend; // { listTools(), callTool(name,args,timeout), close() }
+let sock = null;                       // current gateway socket
+const slots = new Map();               // name -> slot
+const routes = new Map();              // exposed tool name -> { slot, real, tool }
+let queue = Promise.resolve();         // reconcile runs one at a time
 
-async function startBackend() {
-  if (has('mock')) {
-    const tools = [{ name: 'echo', description: 'Mock echo tool', inputSchema: { type: 'object', properties: { text: { type: 'string' } } } }];
-    return {
-      listTools: async () => tools,
-      callTool: async (name, a) => {
-        if (name !== 'echo') throw Object.assign(new Error(`unknown tool ${name}`), { code: 'UNKNOWN_TOOL' });
-        return { content: [{ type: 'text', text: `echo: ${a.text ?? ''}` }] };
-      },
-      close: async () => {},
-    };
-  }
-  const [command, ...cmdArgs] = cfg.desktop_commander?.command ?? ['npx', '-y', '@wonderwhy-er/desktop-commander@latest'];
-  const transport = new StdioClientTransport({ command, args: cmdArgs, stderr: 'inherit' });
+const withTimeout = (p, ms, msg) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(msg)), ms).unref())]);
+
+async function connectStdio(command, onExit) {
+  const [cmd, ...cmdArgs] = command;
+  const transport = new StdioClientTransport({ command: cmd, args: cmdArgs, stderr: 'inherit' });
   const client = new Client({ name: 'remote-mcp-agent', version: '0.1.0' }, { capabilities: {} });
-  await client.connect(transport);
-  transport.onclose = () => { if (shuttingDown) return; log('ERROR', 'local MCP server exited'); process.exit(1); }; // supervisor restarts us
+  try { await withTimeout(client.connect(transport), START_TIMEOUT_MS, 'start timed out'); }
+  catch (e) { await client.close().catch(() => {}); throw e; }
+  transport.onclose = () => { if (!shuttingDown) onExit(); };
   return {
     listTools: async () => (await client.listTools()).tools,
     callTool: (name, a, timeout) => client.callTool({ name, arguments: a }, undefined, { timeout, resetTimeoutOnProgress: true }),
     close: () => client.close(),
   };
+}
+
+function mockConn() {
+  const tools = [{ name: 'echo', description: 'Mock echo tool', inputSchema: { type: 'object', properties: { text: { type: 'string' } } } }];
+  return {
+    listTools: async () => tools,
+    callTool: async (name, a) => {
+      if (name !== 'echo') throw Object.assign(new Error(`unknown tool ${name}`), { code: 'UNKNOWN_TOOL' });
+      return { content: [{ type: 'text', text: `echo: ${a.text ?? ''}` }] };
+    },
+    close: async () => {},
+  };
+}
+
+const enabledNames = (slot) => {
+  const names = slot.tools.map((t) => t.name);
+  return slot.enabledPref ? names.filter((n) => slot.enabledPref.includes(n)) : names.filter((n) => !slot.defaultDisabled.includes(n));
+};
+function rebuild() {
+  routes.clear();
+  for (const slot of slots.values()) {
+    if (slot.status !== 'running') continue;
+    const on = new Set(enabledNames(slot));
+    for (const t of slot.tools) {
+      if (!on.has(t.name) || policy.blocked_tools.includes(t.name)) continue; // blocked tools are hidden, not just refused
+      const exposed = slot.prefix + t.name;
+      if (!routes.has(exposed)) routes.set(exposed, { slot, real: t.name, tool: { ...t, name: exposed } });
+    }
+  }
+}
+const exposedTools = () => [...routes.values()].map((r) => r.tool);
+const statusList = () => [...slots.values()].map((s) => ({
+  name: s.name, builtin: !!s.builtin, template: s.template, status: s.status, error: s.error ?? null, prefix: s.prefix,
+  tools: s.tools.map((t) => ({ name: t.name, description: String(t.description || '').slice(0, 160) })), enabled: enabledNames(s),
+}));
+const tx = (obj) => sock && sock.readyState === 1 && sock.send(JSON.stringify(obj));
+const announce = () => { rebuild(); tx({ type: 'backends_status', backends: statusList() }); tx({ type: 'tools_changed', tools: exposedTools() }); };
+
+async function stopSlot(slot) { slot.stopped = true; const c = slot.conn; slot.conn = null; await c?.close().catch(() => {}); }
+
+async function reconcile(desired) {
+  const want = new Set(desired.map((d) => d.name));
+  for (const [name, slot] of [...slots]) if (!slot.builtin && !want.has(name)) { await stopSlot(slot); slots.delete(name); }
+  const starts = [];
+  for (const d of desired) {
+    const existing = slots.get(d.name);
+    const sig = JSON.stringify([d.template, d.params ?? {}]);
+    const base = { name: d.name, template: d.template, sig, tools: [], error: null, prefix: '', defaultDisabled: [], enabledPref: d.enabled_tools ?? null };
+    if (d.name === 'desktop-commander') continue; // built in, not managed remotely
+    if (d.enabled === false) {
+      if (existing?.status !== 'disabled') { if (existing) await stopSlot(existing); slots.set(d.name, { ...base, status: 'disabled' }); }
+      continue;
+    }
+    if (existing?.status === 'running' && existing.sig === sig) { existing.enabledPref = d.enabled_tools ?? null; continue; }
+    if (existing) await stopSlot(existing);
+    let r;
+    try { r = resolveBackend(d, policy); } catch (e) { slots.set(d.name, { ...base, status: 'error', error: e.message }); continue; }
+    const slot = { ...base, prefix: r.prefix, defaultDisabled: r.defaultDisabled, status: 'starting', conn: null };
+    slots.set(d.name, slot); starts.push([slot, r]);
+  }
+  announce(); // show "starting" right away; the first run may download the package
+  await Promise.all(starts.map(async ([slot, r]) => {
+    try {
+      const conn = await connectStdio(r.command, () => { if (slot.stopped) return; slot.status = 'error'; slot.error = 'server exited'; slot.tools = []; slot.conn = null; log('WARN', `backend ${slot.name} exited`); announce(); });
+      if (slot.stopped) return conn.close().catch(() => {});
+      slot.conn = conn; slot.tools = await conn.listTools(); slot.status = 'running';
+      log('INFO', `backend ${slot.name} running (${slot.tools.length} tools)`);
+    } catch (e) { slot.status = 'error'; slot.error = String(e.message).slice(0, 200); log('WARN', `backend ${slot.name} failed: ${slot.error}`); }
+  }));
+  announce();
+}
+
+async function startBuiltin() {
+  let conn;
+  if (has('mock')) conn = mockConn();
+  else {
+    const command = cfg.desktop_commander?.command ?? ['npx', '-y', '@wonderwhy-er/desktop-commander@latest'];
+    conn = await connectStdio(command, () => { log('ERROR', 'local MCP server exited'); process.exit(1); }); // supervisor restarts us
+  }
+  slots.set('desktop-commander', { name: 'desktop-commander', builtin: true, template: 'builtin', prefix: '', status: 'running', tools: await conn.listTools(), defaultDisabled: [], enabledPref: null, conn });
+  rebuild();
 }
 
 // ---- gateway connection ---------------------------------------------------------
@@ -107,28 +187,33 @@ async function connect() {
   const ws = new WebSocket(cfg.gateway, { headers: { authorization: `Bearer ${cfg.device_secret}`, 'x-device-id': cfg.device_id } });
   let pingTimer;
 
-  ws.on('open', async () => {
-    backoff = 1000;
+  ws.on('open', () => {
+    sock = ws; backoff = 1000;
     ws.send(JSON.stringify({
       type: 'hello', device_id: cfg.device_id, protocol_version: PROTOCOL_VERSION,
       name: cfg.name, platform: `${process.platform}-${process.arch}`, hostname: os.hostname(),
-      tools: await backend.listTools(),
+      tools: exposedTools(), custom_backends: policy.allow_custom_backends,
     }));
+    tx({ type: 'backends_status', backends: statusList() });
     pingTimer = setInterval(() => ws.readyState === 1 && ws.send(JSON.stringify({ type: 'ping' })), PING_MS);
   });
 
   ws.on('message', async (raw) => {
     let m; try { m = JSON.parse(raw.toString()); } catch { return; }
     if (m.type === 'hello_ack') return log('INFO', `connected to gateway (session ${m.session_id})`);
+    if (m.type === 'config') { queue = queue.then(() => reconcile(Array.isArray(m.backends) ? m.backends : [])).catch((e) => log('ERROR', `reconcile: ${e.message}`)); return; }
     if (m.type !== 'request') return;
     const reply = (body) => ws.readyState === 1 && ws.send(JSON.stringify({ type: 'response', request_id: m.request_id, ...body }));
     try {
-      if (m.method === 'tools/list') return reply({ result: { tools: await backend.listTools() } });
+      if (m.method === 'tools/list') return reply({ result: { tools: exposedTools() } });
       if (m.method === 'tools/call') {
-        const denied = check(policy, m.params.name, m.params.arguments ?? {});
+        const route = routes.get(m.params.name);
+        if (!route) return reply({ error: { code: 'UNKNOWN_TOOL', message: `unknown tool ${String(m.params.name).slice(0, 80)}` } });
+        const args = m.params.arguments ?? {};
+        const denied = check(policy, route.real, args);
         if (denied) { log('WARN', `policy denied ${m.params.name}: ${denied}`); return reply({ error: { code: 'POLICY_DENIED', message: `Blocked by device policy: ${denied}` } }); }
-        const t = Number(m.params.arguments?.timeout_ms);
-        const result = await backend.callTool(m.params.name, m.params.arguments ?? {}, Number.isFinite(t) ? t + 4000 : 60_000);
+        const t = Number(args.timeout_ms);
+        const result = await route.slot.conn.callTool(route.real, args, Number.isFinite(t) ? t + 4000 : 60_000);
         return reply({ result });
       }
       reply({ error: { code: 'UNSUPPORTED_METHOD', message: m.method } });
@@ -140,7 +225,7 @@ async function connect() {
   ws.on('unexpected-response', (_req, res) => log('ERROR', `gateway rejected connection: HTTP ${res.statusCode}`));
   ws.on('error', (e) => log('WARN', `ws error: ${e.message}`));
   ws.on('close', (code) => {
-    clearInterval(pingTimer);
+    clearInterval(pingTimer); if (sock === ws) sock = null;
     if (code === 4003) { log('ERROR', 'device revoked; exiting'); process.exit(3); }
     log('INFO', `disconnected (${code}); retry in ${backoff / 1000}s`);
     setTimeout(connect, backoff);
@@ -148,9 +233,9 @@ async function connect() {
   });
 }
 
-backend = await startBackend();
+await startBuiltin();
 log('INFO', `local MCP backend ready${has('mock') ? ' (mock)' : ''}; device ${cfg.device_id} → ${cfg.gateway}`);
-const stop = async () => { shuttingDown = true; await backend.close().catch(() => {}); process.exit(0); };
+const stop = async () => { shuttingDown = true; await Promise.all([...slots.values()].map((s) => s.conn?.close().catch(() => {}))); process.exit(0); };
 process.on('SIGINT', stop);
 process.on('SIGTERM', stop);
 connect();

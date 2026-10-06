@@ -17,6 +17,7 @@ MCP client ──HTTPS /mcp──▶ gateway ◀──WSS /device── agent �
 - **MCP Streamable HTTP** at `/mcp` (JSON responses), tool calls relayed to the chosen device; per-device tool lists.
 - **Auth**: static bearer tokens for clients; **OAuth 2.1** (dynamic client registration, PKCE S256, refresh rotation, RFC 8414/9728 metadata) for connectors such as ChatGPT. Consent needs an admin ("owner") token.
 - **Web admin console** at `/admin/` (mobile-friendly): devices, clients/OAuth grants, activity log, pairing approval. Sign-in is **TOTP only** (any authenticator app), enrolled by scanning a QR in your own browser.
+- **MCP servers per device, managed in the console**: pick a template (Chrome DevTools, Playwright) or, if the device opted in, a custom command; per-tool on/off switches; tools appear as `prefix_toolname` next to the built-in Desktop Commander tools.
 - **Per-device secrets**, stored only as SHA-256 hashes; instant revocation (live connection is dropped).
 - **Pairing**: `/pair/*` does not exist until you open a 3-minute window from the CLI; approve the request in the terminal.
 - **Routing that works with stateless clients**: pass `device_id` on any call; `device_select` sets a per-client default.
@@ -66,6 +67,13 @@ node agent/agent.js            # or: bash deploy/install-macos.sh  (LaunchAgent)
 
 Sign-in locks for 15 minutes after 5 wrong codes, a code can be used once, sessions expire after 30 min idle / 12 h, writes need a CSRF token.
 
+### Adding MCP servers to a device
+Console → Devices → *MCP servers* → *Add an MCP server*. The gateway stores the list and pushes it to the agent whenever it connects or you change it.
+- **Templates** (`agent/backends.js`) are chosen by the agent: the console sends only `{template, params}`, so it cannot inject flags like `--executablePath`. Risky tools (`evaluate_script`, `upload_file`, …) start disabled; tick them on per tool.
+- **Custom command** runs any command as the device's user and is **off by default**. Enable it on a device you control by adding `{"allow_custom_backends": true}` to that device's `~/.config/remote-mcp/policy.json`.
+- The device policy (blocked paths, `file:` URLs, …) applies to every added server's tools too. Packages are fetched with `npx -y <pkg>@latest`; pin a version via a custom command if you need to.
+- A failing server shows its error in the console and does not affect the others.
+
 ### Revoke
 ```bash
 node gateway/admin.js client-revoke <client_id>     # static client token
@@ -80,7 +88,7 @@ OAuth grants live in `oauth_tokens`; revoke by setting `revoked_at` (see docs/SE
 ## Layout
 ```
 gateway/   server.js (HTTP/MCP/WS)  oauth.js  pairing.js  web.js + ui/ (admin console)  totp.js  db.js  admin.js (offline CLI)
-agent/     agent.js (device side)   policy.js (guardrails)
+agent/     agent.js (device side)   policy.js (guardrails)   backends.js (MCP server templates)
 deploy/    install-linux.sh  install-macos.sh  update.sh  *.service.in
 test/      e2e, OAuth, pairing and policy tests (node --test)
 ```
