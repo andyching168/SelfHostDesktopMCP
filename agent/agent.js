@@ -12,7 +12,9 @@ import { loadPolicy, check } from './policy.js';
 import { resolveBackend } from './backends.js';
 
 const PROTOCOL_VERSION = 1;
-const PING_MS = 20_000;
+const PING_MS = Number(process.env.RMCP_PING_MS) || 20_000;
+const HANDSHAKE_MS = Number(process.env.RMCP_HANDSHAKE_MS) || 15_000;   // give up on a connection attempt that gets no answer
+const LIVENESS_MS = Number(process.env.RMCP_LIVENESS_MS) || 50_000;     // no message (pong) from the gateway for this long => the link is dead
 const args = process.argv.slice(2);
 const cmd = args[0] && !args[0].startsWith('--') ? args[0] : 'run';
 const flag = (n, d) => { const i = args.indexOf(`--${n}`); return i >= 0 ? args[i + 1] : d; };
@@ -199,11 +201,11 @@ async function startBuiltin() {
 // ---- gateway connection ---------------------------------------------------------
 let backoff = 1000;
 async function connect() {
-  const ws = new WebSocket(cfg.gateway, { headers: { authorization: `Bearer ${cfg.device_secret}`, 'x-device-id': cfg.device_id } });
-  let pingTimer;
+  const ws = new WebSocket(cfg.gateway, { handshakeTimeout: HANDSHAKE_MS, headers: { authorization: `Bearer ${cfg.device_secret}`, 'x-device-id': cfg.device_id } });
+  let pingTimer, watchdog, lastRx = Date.now(), lastTick = Date.now();
 
   ws.on('open', () => {
-    sock = ws; backoff = 1000;
+    sock = ws; lastRx = lastTick = Date.now();
     ws.send(JSON.stringify({
       type: 'hello', device_id: cfg.device_id, protocol_version: PROTOCOL_VERSION,
       name: cfg.name, platform: `${process.platform}-${process.arch}`, hostname: os.hostname(),
@@ -211,11 +213,18 @@ async function connect() {
     }));
     tx({ type: 'backends_status', backends: statusList() });
     pingTimer = setInterval(() => ws.readyState === 1 && ws.send(JSON.stringify({ type: 'ping' })), PING_MS);
+    // A sleeping laptop or a dropped NAT mapping leaves a socket that looks open but is dead, and TCP can take many minutes to
+    // notice. The gateway answers every ping, so silence means dead; a long gap between timer ticks means the machine was asleep.
+    watchdog = setInterval(() => {
+      const t = Date.now(), slept = t - lastTick > LIVENESS_MS; lastTick = t;
+      if (slept || t - lastRx > LIVENESS_MS) { log('WARN', slept ? 'machine was suspended; reconnecting' : 'gateway silent; reconnecting'); ws.terminate(); }
+    }, Math.max(100, Math.min(10_000, LIVENESS_MS / 3)));
   });
 
   ws.on('message', async (raw) => {
+    lastRx = Date.now();
     let m; try { m = JSON.parse(raw.toString()); } catch { return; }
-    if (m.type === 'hello_ack') return log('INFO', `connected to gateway (session ${m.session_id})`);
+    if (m.type === 'hello_ack') { backoff = 1000; return log('INFO', `connected to gateway (session ${m.session_id})`); } // only a completed handshake resets the backoff
     if (m.type === 'config') { queue = queue.then(() => reconcile(Array.isArray(m.backends) ? m.backends : [])).catch((e) => log('ERROR', `reconcile: ${e.message}`)); return; }
     if (m.type !== 'request') return;
     const reply = (body) => ws.readyState === 1 && ws.send(JSON.stringify({ type: 'response', request_id: m.request_id, ...body }));
@@ -240,10 +249,10 @@ async function connect() {
   ws.on('unexpected-response', (_req, res) => log('ERROR', `gateway rejected connection: HTTP ${res.statusCode}`));
   ws.on('error', (e) => log('WARN', `ws error: ${e.message}`));
   ws.on('close', (code) => {
-    clearInterval(pingTimer); if (sock === ws) sock = null;
+    clearInterval(pingTimer); clearInterval(watchdog); if (sock === ws) sock = null;
     if (code === 4003) { log('ERROR', 'device revoked; exiting'); process.exit(3); }
     log('INFO', `disconnected (${code}); retry in ${backoff / 1000}s`);
-    setTimeout(connect, backoff);
+    setTimeout(connect, backoff * (0.8 + Math.random() * 0.4)); // jitter so many agents do not retry in lockstep
     backoff = Math.min(backoff * 2, 30_000);
   });
 }
