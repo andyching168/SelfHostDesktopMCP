@@ -64,9 +64,11 @@ async function renderDevices() {
 
 // ---- device detail: MCP servers ----
 const openTools = new Set();
+let addCache = null; // the "Add an MCP server" form survives the periodic re-render, otherwise half-typed fields vanish
 const pillFor = (st) => h('span', { class: 'pill ' + (st === 'running' ? 'ok' : st === 'error' ? 'err' : '') }, st);
 async function renderDeviceDetail() {
   const root = $('#tab-devices');
+  if (addCache && root.contains(document.activeElement) && addCache.node.contains(document.activeElement)) return; // don't steal focus while typing in the add form
   const d = await api(`/devices/${encodeURIComponent(detail)}/backends`), base = `/devices/${encodeURIComponent(detail)}/backends`;
   const act = (path, body, msg) => async () => { try { await api(base + path, { body }); if (msg) toast(msg); render(); } catch (e) { toast(e.message, true); } };
 
@@ -108,7 +110,7 @@ async function renderDeviceDetail() {
     else { desc.textContent = 'Runs any command as this device\'s user (it must be installed there; an absolute path is safest). Prefer a template when one exists.'; fields.append(h('input', { id: 'c-name', placeholder: 'name (a-z, 0-9, -)' }), h('input', { id: 'c-cmd', placeholder: 'command, e.g. npx' }), h('textarea', { id: 'c-args', rows: 3, placeholder: 'one argument per line' })); }
   };
   sel.addEventListener('change', draw); draw();
-  const add = h('div', { class: 'item col' }, h('div', { class: 'name' }, 'Add an MCP server'), sel, desc, fields,
+  const builtAdd = h('div', { class: 'item col' }, h('div', { class: 'name' }, 'Add an MCP server'), sel, desc, fields,
     h('div', { class: 'row' }, h('button', { class: 'small', onclick: async () => {
       const body = { template: sel.value, params: {} };
       if (sel.value === 'custom') { body.name = $('#c-name').value.trim(); body.params = { command: $('#c-cmd').value.trim(), args: $('#c-args').value.split('\n').map((x) => x.trim()).filter(Boolean) }; }
@@ -119,8 +121,9 @@ async function renderDeviceDetail() {
         if (auth === 'oauth') Object.assign(body.params, { client_id: v('#r-cid'), client_secret: v('#r-secret'), ...(v('#r-scope') ? { scope: v('#r-scope') } : {}) });
       }
       else fields.querySelectorAll('[data-param]').forEach((i) => (body.params[i.dataset.param] = i.checked));
-      try { await api(base, { body }); toast('Added. The device is starting it (first run may download the package).'); render(); } catch (e) { toast(e.message, true); }
+      try { await api(base, { body }); toast('Added. The device is starting it (first run may download the package).'); addCache = null; render(); } catch (e) { toast(e.message, true); }
     } }, 'Add'), d.device.online ? null : h('span', { class: 'sub' }, 'Device is offline: it will start when it reconnects.')));
+  const addKey = detail + '|' + !!d.device.custom_backends, add = addCache?.key === addKey ? addCache.node : (addCache = { key: addKey, node: builtAdd }).node;
 
   root.replaceChildren(
     h('div', { class: 'row' }, h('button', { class: 'small ghost', onclick: () => { detail = null; render(); } }, '← Devices'), h('div', { class: 'name' }, d.device.name || d.device.device_id, ' ', h('span', { class: 'pill ' + (d.device.online ? 'ok' : '') }, d.device.online ? 'online' : 'offline'))),
