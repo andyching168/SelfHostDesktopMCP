@@ -8,6 +8,9 @@ import path from 'node:path';
 import WebSocket from 'ws';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
+import { ClientCredentialsProvider } from '@modelcontextprotocol/sdk/client/auth-extensions.js';
 import { loadPolicy, check } from './policy.js';
 import { resolveBackend } from './backends.js';
 
@@ -98,15 +101,31 @@ const childPath = () => [...new Set([...(process.env.PATH || '').split(path.deli
 const PASS_ENV = ['DISPLAY', 'XAUTHORITY', 'WAYLAND_DISPLAY', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS', 'XDG_SESSION_TYPE', 'XDG_CURRENT_DESKTOP', 'LANG', 'LC_ALL'];
 const childEnv = () => ({ PATH: childPath(), ...Object.fromEntries(PASS_ENV.filter((k) => process.env[k]).map((k) => [k, process.env[k]])) });
 
-async function connectStdio(command, onExit) {
-  const [cmd, ...cmdArgs] = command;
-  const transport = new StdioClientTransport({ command: cmd, args: cmdArgs, env: childEnv(), stderr: 'inherit' });
-  const client = new Client({ name: 'remote-mcp-agent', version: '0.1.0' }, { capabilities: {} });
-  try { await withTimeout(client.connect(transport), START_TIMEOUT_MS, 'start timed out'); }
-  catch (e) {
-    await client.close().catch(() => {});
-    if (e?.code === 'ENOENT' || /ENOENT/.test(e?.message || ''))
+function remoteTransports(r) {
+  const url = new URL(r.url);
+  const opts = {};
+  if (r.auth === 'token') opts.requestInit = { headers: { authorization: `Bearer ${r.token}` } };
+  else if (r.auth === 'oauth') opts.authProvider = new ClientCredentialsProvider({ clientId: r.client_id, clientSecret: r.client_secret, ...(r.scope ? { scope: r.scope } : {}) });
+  return [() => new StreamableHTTPClientTransport(url, opts), () => new SSEClientTransport(url, opts)]; // modern transport first, legacy SSE as fallback
+}
+
+// `target` is a command array (stdio) or {remote: {...}} for an MCP server reachable by URL
+async function connectBackend(target, onExit) {
+  const remote = Array.isArray(target) ? null : target.remote;
+  const command = remote ? null : target;
+  const [cmd, ...cmdArgs] = command ?? [];
+  const makers = remote ? remoteTransports(remote) : [() => new StdioClientTransport({ command: cmd, args: cmdArgs, env: childEnv(), stderr: 'inherit' })];
+  let client, transport, lastErr;
+  for (const make of makers) {
+    transport = make(); client = new Client({ name: 'remote-mcp-agent', version: '0.1.0' }, { capabilities: {} });
+    try { await withTimeout(client.connect(transport), START_TIMEOUT_MS, 'start timed out'); lastErr = null; break; }
+    catch (e) { lastErr = e; await client.close().catch(() => {}); }
+  }
+  if (lastErr) {
+    const e = lastErr;
+    if (!remote && (e?.code === 'ENOENT' || /ENOENT/.test(e?.message || '')))
       throw new Error(`command "${cmd}" not found on this device. Use its absolute path, or add its folder to "extra_path" in ~/.config/remote-mcp/device.json`);
+    if (remote) throw new Error(`cannot connect to ${new URL(remote.url).origin}: ${String(e?.message ?? e).replace(/Bearer\s+\S+/g, 'Bearer ***')}`);
     throw e;
   }
   transport.onclose = () => { if (!shuttingDown) onExit(); };
@@ -178,7 +197,7 @@ async function reconcile(desired) {
   announce(); // show "starting" right away; the first run may download the package
   await Promise.all(starts.map(async ([slot, r]) => {
     try {
-      const conn = await connectStdio(r.command, () => { if (slot.stopped) return; slot.status = 'error'; slot.error = 'server exited'; slot.tools = []; slot.conn = null; log('WARN', `backend ${slot.name} exited`); announce(); });
+      const conn = await connectBackend(r.remote ? { remote: r.remote } : r.command, () => { if (slot.stopped) return; slot.status = 'error'; slot.error = 'server exited'; slot.tools = []; slot.conn = null; log('WARN', `backend ${slot.name} exited`); announce(); });
       if (slot.stopped) return conn.close().catch(() => {});
       slot.conn = conn; slot.tools = await conn.listTools(); slot.status = 'running';
       log('INFO', `backend ${slot.name} running (${slot.tools.length} tools)`);
@@ -192,7 +211,7 @@ async function startBuiltin() {
   if (has('mock')) conn = mockConn();
   else {
     const command = cfg.desktop_commander?.command ?? ['npx', '-y', '@wonderwhy-er/desktop-commander@latest'];
-    conn = await connectStdio(command, () => { log('ERROR', 'local MCP server exited'); process.exit(1); }); // supervisor restarts us
+    conn = await connectBackend(command, () => { log('ERROR', 'local MCP server exited'); process.exit(1); }); // supervisor restarts us
   }
   slots.set('desktop-commander', { name: 'desktop-commander', builtin: true, template: 'builtin', prefix: '', status: 'running', tools: await conn.listTools(), defaultDisabled: [], enabledPref: null, conn });
   rebuild();

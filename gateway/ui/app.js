@@ -88,11 +88,23 @@ async function renderDeviceDetail() {
   });
 
   // add form
-  const sel = h('select', {}, ...d.catalog.map((t) => h('option', { value: t.id }, t.title)), d.device.custom_backends ? h('option', { value: 'custom' }, 'Custom command…') : null);
+  const sel = h('select', {}, ...d.catalog.map((t) => h('option', { value: t.id }, t.title)), d.device.custom_backends ? h('option', { value: 'remote' }, 'MCP server by URL…') : null, d.device.custom_backends ? h('option', { value: 'custom' }, 'Custom command…') : null);
   const desc = h('p', { class: 'sub' }), fields = h('div', {});
   const draw = () => {
     const t = d.catalog.find((c) => c.id === sel.value); fields.replaceChildren();
     if (t) { desc.textContent = t.description + (t.default_disabled.length ? ` Disabled by default: ${t.default_disabled.join(', ')}.` : ''); for (const p of t.params) fields.append(h('label', { class: 'check' }, h('input', { type: 'checkbox', 'data-param': p.key, checked: !!p.default }), ' ' + p.label)); }
+    else if (sel.value === 'remote') {
+      desc.textContent = 'Connects from this device to an MCP server reachable by URL (e.g. http://127.0.0.1:3000/mcp). Streamable HTTP is tried first, then legacy SSE. Token and OAuth secrets are stored on the gateway and never shown again.';
+      const authSel = h('select', { id: 'r-auth' }, h('option', { value: 'none' }, 'No authentication'), h('option', { value: 'token' }, 'Bearer token'), h('option', { value: 'oauth' }, 'OAuth (client credentials)'));
+      const authBox = h('div', {});
+      const drawAuth = () => {
+        authBox.replaceChildren();
+        if (authSel.value === 'token') authBox.append(h('input', { id: 'r-token', type: 'password', autocomplete: 'off', placeholder: 'bearer token' }));
+        if (authSel.value === 'oauth') authBox.append(h('input', { id: 'r-cid', placeholder: 'client_id' }), h('input', { id: 'r-secret', type: 'password', autocomplete: 'off', placeholder: 'client_secret' }), h('input', { id: 'r-scope', placeholder: 'scope (optional)' }));
+      };
+      authSel.addEventListener('change', drawAuth); drawAuth();
+      fields.append(h('input', { id: 'r-name', placeholder: 'name (a-z, 0-9, -)' }), h('input', { id: 'r-url', placeholder: 'http://127.0.0.1:3000/mcp' }), authSel, authBox);
+    }
     else { desc.textContent = 'Runs any command as this device\'s user (it must be installed there; an absolute path is safest). Prefer a template when one exists.'; fields.append(h('input', { id: 'c-name', placeholder: 'name (a-z, 0-9, -)' }), h('input', { id: 'c-cmd', placeholder: 'command, e.g. npx' }), h('textarea', { id: 'c-args', rows: 3, placeholder: 'one argument per line' })); }
   };
   sel.addEventListener('change', draw); draw();
@@ -100,6 +112,12 @@ async function renderDeviceDetail() {
     h('div', { class: 'row' }, h('button', { class: 'small', onclick: async () => {
       const body = { template: sel.value, params: {} };
       if (sel.value === 'custom') { body.name = $('#c-name').value.trim(); body.params = { command: $('#c-cmd').value.trim(), args: $('#c-args').value.split('\n').map((x) => x.trim()).filter(Boolean) }; }
+      else if (sel.value === 'remote') {
+        const v = (id) => ($(id)?.value ?? '').trim(), auth = v('#r-auth');
+        body.name = v('#r-name'); body.params = { url: v('#r-url'), auth };
+        if (auth === 'token') body.params.token = v('#r-token');
+        if (auth === 'oauth') Object.assign(body.params, { client_id: v('#r-cid'), client_secret: v('#r-secret'), ...(v('#r-scope') ? { scope: v('#r-scope') } : {}) });
+      }
       else fields.querySelectorAll('[data-param]').forEach((i) => (body.params[i.dataset.param] = i.checked));
       try { await api(base, { body }); toast('Added. The device is starting it (first run may download the package).'); render(); } catch (e) { toast(e.message, true); }
     } }, 'Add'), d.device.online ? null : h('span', { class: 'sub' }, 'Device is offline: it will start when it reconnects.')));

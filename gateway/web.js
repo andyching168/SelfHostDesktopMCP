@@ -8,7 +8,8 @@ import { fileURLToPath } from 'node:url';
 import QRCode from 'qrcode';
 import { sha256, now } from './db.js';
 import { newTotpSecret, verifyTotp, otpauthUri } from './totp.js';
-import { CATALOG, NAME_RE } from '../agent/backends.js';
+import { CATALOG, NAME_RE, checkRemoteParams } from '../agent/backends.js';
+const maskSecrets = (p) => { const o = { ...p }; for (const k of ['token', 'client_secret']) if (o[k]) o[k] = '********'; return o; }; // never send stored secrets back to the browser
 
 const UI_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'ui');
 const ASSETS = { '/admin/': ['index.html', 'text/html; charset=utf-8'], '/admin/app.js': ['app.js', 'text/javascript; charset=utf-8'], '/admin/style.css': ['style.css', 'text/css; charset=utf-8'] };
@@ -139,7 +140,7 @@ export function createWeb({ db, publicUrl, log, devices, listDevices, revokeDevi
         const st = new Map((live?.backends ?? []).map((b) => [b.name, b]));
         const shape = (name, extra) => { const b = st.get(name); return { name, status: live ? (b?.status ?? 'waiting for agent') : 'device offline', error: b?.error ?? null, prefix: b?.prefix ?? '', tools: b?.tools ?? [], enabled_tools: b?.enabled ?? [], ...extra }; };
         const servers = [shape('desktop-commander', { builtin: true, template: 'builtin', enabled: true, status: live ? (st.get('desktop-commander')?.status ?? 'running') : 'device offline' }),
-          ...rows.map((r) => shape(r.name, { builtin: false, template: r.template, params: JSON.parse(r.params), enabled: !!r.enabled, explicit_tools: r.enabled_tools ? JSON.parse(r.enabled_tools) : null }))];
+          ...rows.map((r) => shape(r.name, { builtin: false, template: r.template, params: maskSecrets(JSON.parse(r.params)), enabled: !!r.enabled, explicit_tools: r.enabled_tools ? JSON.parse(r.enabled_tools) : null }))];
         const catalog = Object.entries(CATALOG).map(([id, t]) => ({ id, title: t.title, description: t.description, params: t.params, default_disabled: t.default_disabled }));
         return sendJson(res, 200, { device: { device_id: did, name: dev.name, online: !!live, custom_backends: !!live?.custom }, catalog, servers }), true;
       }
@@ -147,7 +148,13 @@ export function createWeb({ db, publicUrl, log, devices, listDevices, revokeDevi
       if (req.method === 'POST' && !mm[2]) { // add
         const template = String(m.template ?? ''), params = m.params && typeof m.params === 'object' ? m.params : {};
         let name = template;
-        if (template === 'custom') {
+        if (template === 'remote') {
+          name = String(m.name ?? '');
+          if (!live) return sendJson(res, 409, { error: 'the device must be online to add a remote server' }), true;
+          if (!live.custom) return sendJson(res, 403, { error: 'remote servers are disabled on this device (allow_custom_backends in its local policy.json)' }), true;
+          if (!NAME_RE.test(name) || ['custom', 'remote', 'desktop-commander'].includes(name)) return sendJson(res, 400, { error: 'name: lowercase letters, digits, dashes' }), true;
+          const bad = checkRemoteParams(params); if (bad) return sendJson(res, 400, { error: bad }), true;
+        } else if (template === 'custom') {
           name = String(m.name ?? '');
           if (!live) return sendJson(res, 409, { error: 'the device must be online to add a custom server' }), true;
           if (!live.custom) return sendJson(res, 403, { error: 'custom servers are disabled on this device (allow_custom_backends in its local policy.json)' }), true;

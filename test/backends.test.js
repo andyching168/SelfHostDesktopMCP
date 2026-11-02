@@ -8,6 +8,7 @@ import { resolveBackend, CATALOG } from '../agent/backends.js';
 
 const PORT = 18769, BASE = `http://127.0.0.1:${PORT}`;
 const FIXTURE = path.resolve('test/fixtures/mock-mcp.js');
+const HTTP_FIXTURE = path.resolve('test/fixtures/mock-http-mcp.js'), HTTP_PORT = 18771;
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'rmcp-be-'));
 const dbPath = path.join(tmp, 'g.db'); const env = { ...process.env, RMCP_DB: dbPath };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -33,6 +34,16 @@ function startAgent(id, secretVal, policy, extra = {}) {
   const p = spawn('node', ['agent/agent.js', '--config', cfg, '--mock', ...(policy ? ['--policy', path.join(tmp, `${id}.policy.json`)] : ['--policy', path.join(tmp, 'none.json')])], { stdio: 'pipe' });
   procs.push(p); return p;
 }
+
+test('resolveBackend: remote needs local opt-in and valid url/auth params', () => {
+  const ok = { allow_custom_backends: true };
+  assert.throws(() => resolveBackend({ template: 'remote', name: 'r1', params: { url: 'http://127.0.0.1:1/mcp' } }, {}), /disabled on this device/);
+  assert.equal(resolveBackend({ template: 'remote', name: 'my-http', params: { url: 'http://127.0.0.1:3000/mcp', auth: 'token', token: 't' } }, ok).prefix, 'my_http_');
+  assert.throws(() => resolveBackend({ template: 'remote', name: 'r1', params: { url: 'file:///etc/passwd' } }, ok), /http\(s\)/);
+  assert.throws(() => resolveBackend({ template: 'remote', name: 'r1', params: { url: 'http://x/mcp', auth: 'token' } }, ok), /token required/);
+  assert.throws(() => resolveBackend({ template: 'remote', name: 'r1', params: { url: 'http://x/mcp', auth: 'oauth', client_id: 'a' } }, ok), /client_id and client_secret/);
+  assert.throws(() => resolveBackend({ template: 'remote', name: 'r1', params: { url: 'http://x/mcp', auth: 'basic' } }, ok), /auth must be/);
+});
 
 test('resolveBackend: catalog is fixed, params are validated, custom needs local opt-in', () => {
   const r = resolveBackend({ template: 'chrome-devtools', name: 'chrome-devtools', params: { headless: true } }, {});
@@ -206,4 +217,25 @@ test('per-client mode: console can switch a client to the live list; ?tools= ove
   assert.ok((await mcp('tools/list', {}, null)).tools.some((t) => t.name === 'mock_srv_ping2'), 'live list now');
   assert.ok(!(await mcp('tools/list', {}, 'stable')).tools.some((t) => t.name === 'mock_srv_ping2'), '?tools=stable wins');
   await api('/clients/mode', { client_id: 'cli', mode: 'stable' });
+});
+
+test('remote server by URL: refused without opt-in, token required, secrets masked, tools work', async () => {
+  const srv = spawn('node', [HTTP_FIXTURE, String(HTTP_PORT), 's3cret'], { stdio: 'pipe' }); procs.push(srv);
+  for (let i = 0; i < 50; i++) { try { await fetch(`http://127.0.0.1:${HTTP_PORT}/`); break; } catch { await sleep(100); } }
+  const url = `http://127.0.0.1:${HTTP_PORT}/mcp`;
+  assert.equal((await api('/devices/by/backends', { template: 'remote', name: 'web-srv', params: { url } })).status, 403);
+  assert.equal((await api('/devices/bx/backends', { template: 'remote', name: 'web-srv', params: { url: 'ftp://x' } })).status, 400);
+  assert.equal((await api('/devices/bx/backends', { template: 'remote', name: 'web-srv', params: { url, auth: 'token' } })).status, 400);
+  // wrong token: starts but reports an error
+  assert.equal((await api('/devices/bx/backends', { template: 'remote', name: 'web-bad', params: { url, auth: 'token', token: 'wrong' } })).status, 200);
+  const bad = await until(async () => (await api('/devices/bx/backends')).body.servers.find((s) => s.name === 'web-bad' && s.status === 'error'));
+  assert.ok(bad.error && !bad.error.includes('wrong'));
+  // right token
+  assert.equal((await api('/devices/bx/backends', { template: 'remote', name: 'web-srv', params: { url, auth: 'token', token: 's3cret' } })).status, 200);
+  await mcp('initialize', { protocolVersion: '2025-06-18' });
+  await mcp('tools/call', { name: 'device_select', arguments: { device_id: 'bx' } });
+  await until(async () => (await toolNames()).includes('web_srv_hello'));
+  assert.equal((await mcp('tools/call', { name: 'web_srv_hello', arguments: { text: 'x' } })).content[0].text, 'hello:x');
+  const sv = (await api('/devices/bx/backends')).body.servers.find((s) => s.name === 'web-srv');
+  assert.equal(sv.params.token, '********'); assert.equal(sv.params.url, url);
 });
